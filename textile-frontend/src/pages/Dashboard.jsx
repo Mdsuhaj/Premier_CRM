@@ -363,12 +363,12 @@ export default function Dashboard() {
 
       <div style={styles.page}>
        
-        <div style={styles.topBar}>
+        {/* <div style={styles.topBar}>
           <div>
             <h1 style={styles.heading}>Dashboard</h1>
             <p style={styles.headingSub}>Welcome back, {user.name || "Super Admin"}</p>
           </div>
-        </div>
+        </div> */}
 
         {error && (
           <div role="alert" style={{ marginBottom: 22, background: isDark ? "rgba(221,132,120,0.08)" : "rgba(150,56,49,0.06)", border: `1px solid ${t.danger}33`, borderRadius: 8, padding: "11px 15px", fontFamily: FONT_UI, fontSize: 13, color: t.danger, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>

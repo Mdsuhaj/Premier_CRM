@@ -124,8 +124,6 @@ export default function TrackOrders() {
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <h1 style={S.heading}>Track Orders</h1>
-      <p style={S.headingSub}>Dispatch and delivery tracking for every order that has shipped.</p>
 
       {error && (
         <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>

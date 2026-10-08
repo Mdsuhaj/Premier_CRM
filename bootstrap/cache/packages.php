@@ -48,4 +48,12 @@
       0 => 'Termwind\\Laravel\\TermwindServiceProvider',
     ),
   ),
+  'yajra/laravel-oci8' => 
+  array (
+    'providers' => 
+    array (
+      0 => 'Yajra\\Oci8\\Oci8ServiceProvider',
+      1 => 'Yajra\\Oci8\\Oci8ValidationServiceProvider',
+    ),
+  ),
 );

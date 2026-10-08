@@ -1,19 +1,13 @@
 // src/pages/reports/SalesLossReportPage.jsx
 //
-// Report 6 of 6. Monthly-wise breakdown of sales lost to declined/
-// cancelled orders, filterable by product, with a grand total row.
+// Report 6 of 6. Monthly-wise breakdown of sales lost to declined /
+// rejected / sale-loss orders, filterable by product, with a grand total row.
 //
-// CHANGES IN THIS VERSION:
-//  - Now also reads the small shared localStorage list that the Ageing
-//    Report writes to when a demo/dummy overdue row is cancelled there,
-//    and folds those in as additional "cancelled orders" — so ageing
-//    cancellations show up here as lost sales instead of just
-//    disappearing. Real orders keep working exactly as before, via the
-//    declined/rejected status on /orders.
-//  - Removed the bottom "Cancel" / reset-filters confirmation control.
-//  - Detail table now sorts newest-first by exact timestamp (not just by
-//    month) — a cancellation made just now always appears at the top of
-//    the list instead of trailing behind older same-month rows.
+// - Only real orders from /orders are used (no dummy/demo rows).
+// - Sort No is taken from the start of the product name
+//   (e.g. "1155 - Lovely Lady NORMAL BLACK" -> 1155). If the name doesn't
+//   start with a number, it falls back to the saved SortNo.
+// - Shade No comes from the order's saved ShadeNo / the product's ShadeNo.
 import { useEffect, useMemo, useState } from "react";
 import { useTheme } from "../../ThemeContext";
 import Layout from "../../components/Layout";
@@ -21,7 +15,7 @@ import { getG } from "../../theme";
 import API from "../../services/api";
 import { exportReportToExcel } from "../../utils/excelIO";
 import {
-  FONT, ExportButton, PageHeading,
+  FONT, ExportButton,
   cardStyle, errorBoxStyle, statCardStyle, todayStamp, fmtAmt,
 } from "./shared";
 
@@ -38,43 +32,23 @@ const SALES_LOSS_DETAIL_COLUMNS = [
   { key: "ValueLost", header: "Value Lost" },
 ];
 
-const CANCELLED_STATUSES = ["declined", "rejected"];
+const CANCELLED_STATUSES = ["sale_loss"];
 
-// Shared handoff from the Ageing Report: cancelling one of its demo/dummy
-// rows there writes an entry here, since dummy rows don't exist on the
-// server and would otherwise vanish instead of showing up as lost sales.
-const DUMMY_SALES_LOSS_KEY = "dummySalesLossOrders";
-function readDummyLostOrders() {
-  try {
-    const existing = JSON.parse(localStorage.getItem(DUMMY_SALES_LOSS_KEY) || "[]");
-    // Reshape into the same order-record shape used everywhere else in
-    // this file (o.product, o.customer, o.CreatedAt, o.TotalAmount…).
-    return existing.map((e) => ({
-      Code: e.code,
-      CreatedAt: e.createdAt,
-      TotalAmount: e.value,
-      Status: "declined",
-      qty: e.qty,
-      Qty: e.qty,
-      product: { Name: e.productName, Code: e.sortNo, ShadeNo: e.shadeNo },
-      customer: { Name: e.customer },
-    }));
-  } catch {
-    return [];
-  }
-}
+// Product name as saved on the order / product.
+const productNameOf = (o) => o.product?.Name || o.OrderDetails?.ProductName || "";
 
-// Shade No is a product-level field (product.ShadeNo), same place
-// ProductCatalog.jsx reads it from. Until every order's product record
-// reliably carries one, fall back to a representative code so the
-// column doesn't just show "—" everywhere. Real value always wins.
-const DUMMY_SHADE_NOS = ["SH-101", "SH-102", "SH-103", "SH-104", "SH-105", "SH-106"];
-function dummyShadeNo(o, i) {
-  return o.product?.ShadeNo || DUMMY_SHADE_NOS[i % DUMMY_SHADE_NOS.length];
-}
+// Sort No = leading number in the product name ("1155 - Lovely Lady ..." -> "1155").
+const sortNoOf = (o) => {
+  const m = productNameOf(o).match(/^\s*(\d[\w.]*)/);
+  return m ? m[1] : (o.OrderDetails?.SortNo || o.product?.SortNo || "—");
+};
 
-// Falls back through possible spellings for a field that isn't Sort
-// No / Shade No (e.g. Qty), where the real backend name is still tbd.
+const shadeNoOf = (o) => o.OrderDetails?.ShadeNo || o.product?.ShadeNo || "—";
+const qtyOf   = (o) => parseFloat(o.Quantity ?? o.qty ?? o.Qty ?? o.quantity) || 0;
+const priceOf = (o) => parseFloat(o.product?.Price) || parseFloat(o.PricePerUnit) || 0;
+const valueOf = (o) => priceOf(o) * qtyOf(o);
+
+// Falls back through possible spellings for a field (e.g. Qty).
 const pick = (obj, ...keys) => {
   for (const k of keys) {
     if (obj && obj[k] !== undefined && obj[k] !== null && obj[k] !== "") return obj[k];
@@ -91,10 +65,7 @@ function monthSortValue(dateStr) {
   const d = dateStr ? new Date(dateStr) : null;
   return d && !isNaN(d.getTime()) ? d.getFullYear() * 12 + d.getMonth() : -1;
 }
-// Full-precision timestamp, for ordering the detail table newest-first —
-// monthSortValue() alone only tells two orders apart by month, so a row
-// cancelled just now could still land behind older same-month rows; this
-// breaks that tie using the actual moment it happened.
+// Full-precision timestamp, so the newest rows appear first in the detail table.
 function dateSortValue(dateStr) {
   const d = dateStr ? new Date(dateStr) : null;
   return d && !isNaN(d.getTime()) ? d.getTime() : -Infinity;
@@ -104,7 +75,6 @@ export default function SalesLossReportPage() {
   const { isDark } = useTheme();
   const themeG = getG(isDark);
   const [allOrders, setAllOrders] = useState([]);
-  const [dummyLostOrders, setDummyLostOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -123,17 +93,15 @@ export default function SalesLossReportPage() {
         setLoading(false);
       }
     })();
-    // Pick up any dummy ageing-report cancellations recorded so far.
-    setDummyLostOrders(readDummyLostOrders());
   }, []);
 
-  const allLost = useMemo(() => {
-    const apiLost = allOrders.filter((o) => CANCELLED_STATUSES.includes((o.Status || "").toLowerCase()));
-    return [...apiLost, ...dummyLostOrders];
-  }, [allOrders, dummyLostOrders]);
+  const allLost = useMemo(
+    () => allOrders.filter((o) => CANCELLED_STATUSES.includes((o.Status || "").toLowerCase())),
+    [allOrders]
+  );
 
   const productOptions = useMemo(
-    () => ["All", ...Array.from(new Set(allLost.map((o) => o.product?.Name).filter(Boolean))).sort()],
+    () => ["All", ...Array.from(new Set(allLost.map((o) => productNameOf(o)).filter(Boolean))).sort()],
     [allLost]
   );
 
@@ -150,53 +118,46 @@ export default function SalesLossReportPage() {
   const lost = useMemo(() => {
     const q = search.trim().toLowerCase();
     return allLost
-      .filter((o) => productFilter === "All" || o.product?.Name === productFilter)
+      .filter((o) => productFilter === "All" || productNameOf(o) === productFilter)
       .filter((o) => monthFilter === "All" || monthKey(o.CreatedAt) === monthFilter)
       .filter((o) => {
         if (!q) return true;
-        return [o.Code, o.product?.Name, o.customer?.Name, o.product?.Code, o.product?.ShadeNo]
+        return [o.Code, productNameOf(o), o.customer?.Name, sortNoOf(o), shadeNoOf(o)]
           .some((v) => String(v ?? "").toLowerCase().includes(q));
       });
   }, [allLost, productFilter, monthFilter, search]);
 
-  const totalValueLost = lost.reduce((s, o) => s + (parseFloat(o.TotalAmount) || 0), 0);
+  const totalValueLost = lost.reduce((s, o) => s + valueOf(o), 0);
   const avgValueLost = lost.length ? totalValueLost / lost.length : 0;
   const uniqueCustomers = new Set(lost.map((o) => o.customer?.Name).filter(Boolean)).size;
 
-  // Monthly breakdown, oldest → newest. Built with a plain reduce
-  // instead of the shared groupBy helper (that helper counts by key,
-  // it doesn't collect items — using it here would have thrown).
+  // Monthly breakdown, oldest → newest.
   const monthly = useMemo(() => {
     const map = {};
     lost.forEach((o) => {
       const key = monthKey(o.CreatedAt);
       if (!map[key]) map[key] = { month: key, count: 0, value: 0, sortKey: monthSortValue(o.CreatedAt) };
       map[key].count += 1;
-      map[key].value += parseFloat(o.TotalAmount) || 0;
+      map[key].value += valueOf(o);
     });
     return Object.values(map).sort((a, b) => a.sortKey - b.sortKey);
   }, [lost]);
 
-  // Per-order detail rows for the table below the monthly summary —
-  // every field here comes straight from the /orders API response (or,
-  // for dummy ageing cancellations, the equivalent shape built above).
-  // Sort No / Shade No are product-level fields, read off o.product
-  // exactly like ProductCatalog.jsx does (Sort No = product.Code,
-  // Shade No = product.ShadeNo).
+  // Per-order detail rows, newest first.
   const detailRows = useMemo(
     () =>
       lost
         .slice()
         .sort((a, b) => dateSortValue(b.CreatedAt) - dateSortValue(a.CreatedAt))
-        .map((o, i) => ({
+        .map((o) => ({
           code: o.Code,
-          sortNo: o.product?.Code ?? "—",
-          shadeNo: dummyShadeNo(o, i),
+          sortNo: sortNoOf(o),
+          shadeNo: shadeNoOf(o),
           qty: pick(o, "qty", "Qty", "quantity", "Quantity"),
-          productName: o.product?.Name || "—",
+          productName: productNameOf(o) || "—",
           customer: o.customer?.Name || "—",
           month: monthKey(o.CreatedAt),
-          value: parseFloat(o.TotalAmount) || 0,
+          value: valueOf(o),
         })),
     [lost]
   );
@@ -237,19 +198,15 @@ export default function SalesLossReportPage() {
   };
 
   const card = cardStyle(themeG);
-  // Navy header / white text, sticky within its own scroll container —
-  // matches ProductCatalog.jsx's table header treatment.
-  const th = { textAlign: "left", fontSize: 11, color: "#FFFFFF", padding: "10px 12px", background: "#1F3A63", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, position: "sticky", top: 0, zIndex: 1 };
-  const td = { padding: "10px 12px", fontSize: 13, color: themeG.textMain };
+  const th = { textAlign: "center", fontSize: 11, color: "#FFFFFF", padding: "10px 12px", background: "#1F3A63", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, position: "sticky", top: 0, zIndex: 1 };
+  const td = { padding: "10px 12px", fontSize: 13, color: themeG.textMain, textAlign: "center" };
   const filterSelect = { padding: "9px 12px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none", minWidth: 200 };
   const filterLabel = { fontSize: 11, fontWeight: 700, color: themeG.textLabel, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6, display: "block" };
   const searchInput = { padding: "9px 12px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none", minWidth: 240 };
-  // Detail table shows ~10 rows before it scrolls internally.
   const tableScroll = { maxHeight: 460, overflowY: "auto", overflowX: "auto" };
 
   return (
-    <Layout pageTitle="Reports">
-      <PageHeading themeG={themeG} title="Sales Loss Report" subtitle="Cancelled orders and lost revenue, broken down month by month." />
+    <Layout pageTitle="Sales Loss Report">
 
       {loading ? (
         <p style={{ color: themeG.textSub, fontFamily: FONT }}>Loading report…</p>
@@ -303,7 +260,7 @@ export default function SalesLossReportPage() {
                 <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 800 }}>
                   <thead>
                     <tr>
-                      {["S.No", "Sort No", "Shade No", "Order No", "Product Name", "Customer", "Qty", "Month", "Value Lost"].map((h) => (
+                      {["S.No", "Sort No", "Shade", "Enquiry No", "Product Name", "Customer", "Qty", "Month", "Value Lost"].map((h) => (
                         <th key={h} style={th}>{h}</th>
                       ))}
                     </tr>

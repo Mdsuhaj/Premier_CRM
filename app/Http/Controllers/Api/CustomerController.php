@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use App\Models\Customer;
 use App\Models\Employee;
@@ -25,6 +26,121 @@ class CustomerController extends Controller
      */
     public function index(Request $request)
     {
+
+        // Serve Oracle BUSINESSPARTNER data instead of the local Customers
+        // table when explicitly asked for (?source=oracle), without
+        // touching the existing local-customer behavior below.
+
+        // if ($request->query('source') === 'oracle') {
+        //     $partners = DB::connection('oracle')
+        //         ->table('BUSINESSPARTNER')
+        //         ->select('NUMBERID', 'SHORTNAME')
+        //         ->whereNotNull('SHORTNAME')
+        //         ->orderBy('SHORTNAME')
+        //         ->get();
+
+        //     return response()->json(
+        //         $partners->map(fn($p) => [
+        //             'Id' => $p->NUMBERID,
+        //             'Name' => $p->SHORTNAME,
+        //         ])
+        //     );
+        // }
+
+        if ($request->query('source') === 'oracle') {
+            $caller = $request->user();
+
+            $query = DB::connection('oracle')
+                ->table('BUSINESSPARTNER')
+                ->select('NUMBERID', 'SHORTNAME', 'TOWN', 'DISTRICT', 'ADDRESSPHONENUMBER', 'EMAILADDRESS', 'TAXREGISTRATIONNUMBER')
+                ->whereNotNull('SHORTNAME');
+
+            // Only real customers, never suppliers — ORDERPARTNER links a
+            // BUSINESSPARTNER to CUSTOMERSUPPLIERTYPE (1 = customer,
+            // 2 = supplier) via ORDERBUSINESSPARTNERNUMBERID. Also require
+            // ORDERCATEGORYCODE = 'DOM' (domestic) on that same ORDERPARTNER
+            // row — a BUSINESSPARTNER can have several ORDERPARTNER rows
+            // (different categories), so both conditions must hold on the
+            // SAME row, not just somewhere across the partner's rows —
+            // hence one whereExists with both conditions inside it, not two
+            // separate ones.
+            $query->whereExists(function ($q) {
+                $q->select(DB::raw(1))
+                    ->from('ORDERPARTNER as o')
+                    ->whereColumn('o.ORDERBUSINESSPARTNERNUMBERID', 'BUSINESSPARTNER.NUMBERID')
+                    ->where('o.CUSTOMERSUPPLIERTYPE', '1')
+                    ->where('o.ORDERCATEGORYCODE', 'DOM');
+            });
+
+            // Scope by end_user's assigned area — Oracle uses TOWN/DISTRICT
+            // (no TALUK column exists in BUSINESSPARTNER). An end_user's
+            // area can come from either the Employee District/Taluk
+            // approval workflow, OR the District field set directly on
+            // their User row via Admin Master (see UserController::store).
+            // Fail closed: if neither is set, show nothing rather than
+            // everything.
+            if ($caller && $caller->role === 'end_user') {
+                $employee = Employee::where('UserId', $caller->id)->first();
+
+                $normalize = function ($raw) {
+                    if (is_array($raw)) {
+                        return array_values(array_filter($raw));
+                    }
+                    if (is_string($raw) && $raw !== '') {
+                        $decoded = json_decode($raw, true);
+                        return (json_last_error() === JSON_ERROR_NONE && is_array($decoded))
+                            ? array_values(array_filter($decoded))
+                            : [$raw];
+                    }
+                    return [];
+                };
+
+                $taluks = $normalize($employee->Taluk ?? $caller->Taluk ?? null);
+                $districts = $normalize($employee->District ?? $caller->District ?? null);
+
+                if (!empty($taluks) || !empty($districts)) {
+                    $query->where(function ($q) use ($taluks, $districts) {
+                        foreach ($taluks as $t) {
+                            $q->orWhereRaw("UPPER(TOWN) LIKE UPPER(?)", ['%' . $t . '%'])
+                                ->orWhereRaw("UPPER(DISTRICT) LIKE UPPER(?)", ['%' . $t . '%']);
+                        }
+                        foreach ($districts as $d) {
+                            $q->orWhereRaw("UPPER(DISTRICT) LIKE UPPER(?)", ['%' . $d . '%']);
+                        }
+                    });
+                } else {
+                    $query->whereRaw('1 = 0'); // no assigned area yet → see nothing
+                }
+            }
+
+            // Scope by admin's assigned District
+            if ($caller && $caller->role === 'admin') {
+                $employee = Employee::where('UserId', $caller->id)->first();
+                $rawDistricts = $employee->District ?? $caller->District ?? null;
+                $districts = [];
+                if (is_array($rawDistricts)) {
+                    $districts = array_values(array_filter($rawDistricts));
+                } elseif (is_string($rawDistricts) && $rawDistricts !== '') {
+                    $decoded = json_decode($rawDistricts, true);
+                    $districts = (json_last_error() === JSON_ERROR_NONE && is_array($decoded))
+                        ? array_values(array_filter($decoded))
+                        : [$rawDistricts];
+                }
+
+                if (!empty($districts)) {
+                    $query->where(function ($q) use ($districts) {
+                        foreach ($districts as $d) {
+                            $q->orWhereRaw("UPPER(DISTRICT) LIKE UPPER(?)", ['%' . $d . '%']);
+                        }
+                    });
+                }
+            }
+
+            return response()->json(
+                $query->orderBy('SHORTNAME')->get()
+            );
+        }
+
         $query = Customer::with('user');
         $caller = $request->user();
 
@@ -34,12 +150,16 @@ class CustomerController extends Controller
 
         if ($caller && $caller->role === 'end_user') {
             $taluks = $this->callerAreas($caller, 'Taluk');
-            $query->where(function ($q) use ($taluks) {
-                foreach ($taluks as $t) {
-                    $q->orWhere('Taluk', $t);
+            $districts = $this->callerAreas($caller, 'District');
+            $query->where(function ($q) use ($taluks, $districts) {
+                if (!empty($taluks)) {
+                    $q->whereIn('Taluk', $taluks);
                 }
-                if (empty($taluks)) {
-                    $q->whereRaw('1 = 0'); // no assigned taluk yet → see nothing
+                if (!empty($districts)) {
+                    $q->orWhereIn('District', $districts);
+                }
+                if (empty($taluks) && empty($districts)) {
+                    $q->whereRaw('1 = 0'); // no assigned area yet → see nothing
                 }
             });
         }
@@ -59,8 +179,8 @@ class CustomerController extends Controller
         if ($search = $request->query('search')) {
             $query->where(function ($q) use ($search) {
                 $q->where('Name', 'like', "%{$search}%")
-                  ->orWhere('Code', 'like', "%{$search}%")
-                  ->orWhere('Phone', 'like', "%{$search}%");
+                    ->orWhere('Code', 'like', "%{$search}%")
+                    ->orWhere('Phone', 'like', "%{$search}%");
             });
         }
 
@@ -87,12 +207,12 @@ class CustomerController extends Controller
         $value = $employee->{$field} ?? $caller->{$field} ?? null;
 
         if (is_array($value)) {
-            return array_values(array_filter($value, fn ($v) => $v !== null && $v !== ''));
+            return array_values(array_filter($value, fn($v) => $v !== null && $v !== ''));
         }
         if (is_string($value) && $value !== '') {
             $decoded = json_decode($value, true);
             if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                return array_values(array_filter($decoded, fn ($v) => $v !== null && $v !== ''));
+                return array_values(array_filter($decoded, fn($v) => $v !== null && $v !== ''));
             }
             return [$value];
         }
@@ -116,8 +236,11 @@ class CustomerController extends Controller
 
         if ($caller && $caller->role === 'end_user') {
             $taluks = $this->callerAreas($caller, 'Taluk');
-            if (!in_array($customer->Taluk, $taluks, true)) {
-                return response()->json(['message' => 'This customer is outside your assigned Taluk(s).'], 403);
+            $districts = $this->callerAreas($caller, 'District');
+            $matchTaluk = !empty($taluks) && in_array($customer->Taluk, $taluks, true);
+            $matchDist = !empty($districts) && in_array($customer->District, $districts, true);
+            if (!$matchTaluk && !$matchDist) {
+                return response()->json(['message' => 'This customer is outside your assigned area.'], 403);
             }
         }
 
@@ -145,36 +268,36 @@ class CustomerController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'name'        => 'required|string|max:191',
-            'phone'       => 'required|string|max:20',
-            'email'       => 'nullable|email|max:191',
-            'type'        => 'required|in:retail,wholesale',
-            'district'    => 'required|string|max:100',
-            'taluk'       => 'required|string|max:100',
-            'address'     => 'nullable|string',
+            'name' => 'required|string|max:191',
+            'phone' => 'required|string|max:20',
+            'email' => 'nullable|email|max:191',
+            'type' => 'required|in:retail,wholesale',
+            'district' => 'required|string|max:100',
+            'taluk' => 'required|string|max:100',
+            'address' => 'nullable|string',
             'creditLimit' => 'nullable|numeric',
             'maxDiscountPct' => 'nullable|numeric|min:0|max:100',
-            'notes'       => 'nullable|string',
+            'notes' => 'nullable|string',
 
             // ── Mobile "Add Customer" parity fields ──────────────────────
-            'businessType'   => 'nullable|string|max:30',
-            'emails'         => 'nullable|array|max:2',
-            'emails.*'       => 'nullable|email|max:191',
-            'phones'         => 'nullable|array|max:2',
-            'phones.*'       => 'nullable|string|max:20',
+            'businessType' => 'nullable|string|max:30',
+            'emails' => 'nullable|array|max:2',
+            'emails.*' => 'nullable|email|max:191',
+            'phones' => 'nullable|array|max:2',
+            'phones.*' => 'nullable|string|max:20',
             'contactPersons' => 'nullable|array|max:2',
-            'contactPersons.*.contactName'  => 'required_with:contactPersons|string|max:191',
+            'contactPersons.*.contactName' => 'required_with:contactPersons|string|max:191',
             'contactPersons.*.contactPhone' => 'required_with:contactPersons|string|max:20',
-            'contactPersons.*.designation'  => 'nullable|string|max:100',
-            'contactPersons.*.email'        => 'nullable|email|max:191',
-            'addresses'      => 'nullable|array|max:2',
-            'addresses.*.address'   => 'required_with:addresses|string|max:255',
-            'addresses.*.address2'  => 'nullable|string|max:255',
-            'addresses.*.city'      => 'required_with:addresses|string|max:100',
+            'contactPersons.*.designation' => 'nullable|string|max:100',
+            'contactPersons.*.email' => 'nullable|email|max:191',
+            'addresses' => 'nullable|array|max:2',
+            'addresses.*.address' => 'required_with:addresses|string|max:255',
+            'addresses.*.address2' => 'nullable|string|max:255',
+            'addresses.*.city' => 'required_with:addresses|string|max:100',
             'addresses.*.stateName' => 'required_with:addresses|string|max:100',
-            'addresses.*.district'  => 'nullable|string|max:100',
-            'addresses.*.country'   => 'required_with:addresses|string|max:100',
-            'addresses.*.pincode'   => 'required_with:addresses|string|max:10',
+            'addresses.*.district' => 'nullable|string|max:100',
+            'addresses.*.country' => 'required_with:addresses|string|max:100',
+            'addresses.*.pincode' => 'required_with:addresses|string|max:10',
             'gstNo' => 'nullable|string|max:15',
             'panNo' => 'nullable|string|max:10',
             'tanNo' => 'nullable|string|max:10',
@@ -197,9 +320,12 @@ class CustomerController extends Controller
         //     assignment.
         if ($caller && $caller->role === 'end_user') {
             $taluks = $this->callerAreas($caller, 'Taluk');
-            if (empty($taluks) || !in_array($validated['taluk'], $taluks, true)) {
+            $districts = $this->callerAreas($caller, 'District');
+            $matchTaluk = !empty($taluks) && in_array($validated['taluk'], $taluks, true);
+            $matchDist = !empty($districts) && in_array($validated['district'], $districts, true);
+            if (!$matchTaluk && !$matchDist) {
                 return response()->json([
-                    'message' => 'You can only add customers in your own assigned Taluk(s).',
+                    'message' => 'You can only add customers in your own assigned District / Taluk(s).',
                 ], 403);
             }
         }
@@ -213,46 +339,46 @@ class CustomerController extends Controller
             }
         }
 
-        $emails = array_values(array_filter($validated['emails'] ?? [], fn ($e) => !empty($e)));
-        $phones = array_values(array_filter($validated['phones'] ?? [], fn ($p) => !empty($p)));
+        $emails = array_values(array_filter($validated['emails'] ?? [], fn($e) => !empty($e)));
+        $phones = array_values(array_filter($validated['phones'] ?? [], fn($p) => !empty($p)));
         $primaryEmail = $validated['email'] ?? ($emails[0] ?? null);
         $primaryPhone = $validated['phone'] ?? ($phones[0] ?? null);
         $primaryAddress = $validated['addresses'][0]['address'] ?? ($validated['address'] ?? null);
 
         $user = User::create([
-            'name'     => $validated['name'],
-            'email'    => $primaryEmail ?? (Str::slug($validated['name']) . '-' . uniqid() . '@premiercrm.com'),
-            'phone'    => $validated['phone'],
+            'name' => $validated['name'],
+            'email' => $primaryEmail ?? (Str::slug($validated['name']) . '-' . uniqid() . '@premiercrm.com'),
+            'phone' => $validated['phone'],
             'password' => $validated['phone'],
-            'role'     => 'customer',
-            'Status'   => 'inactive', // pending approval — login blocked until active
+            'role' => 'customer',
+            'Status' => 'inactive', // pending approval — login blocked until active
         ]);
 
         $customer = Customer::create([
-            'Code'        => $this->generateCustomerCode(),
-            'UserId'      => $user->id,
-            'Name'        => $validated['name'],
-            'Phone'       => $primaryPhone,
-            'Email'       => $primaryEmail,
-            'Type'        => $validated['type'],
-            'District'    => $validated['district'],
-            'Taluk'       => $validated['taluk'],
-            'Address'     => $primaryAddress,
+            'Code' => $this->generateCustomerCode(),
+            'UserId' => $user->id,
+            'Name' => $validated['name'],
+            'Phone' => $primaryPhone,
+            'Email' => $primaryEmail,
+            'Type' => $validated['type'],
+            'District' => $validated['district'],
+            'Taluk' => $validated['taluk'],
+            'Address' => $primaryAddress,
             'CreditLimit' => $validated['creditLimit'] ?? null,
             'MaxDiscountPct' => $validated['maxDiscountPct'] ?? null,
             'Outstanding' => 0,
-            'Status'      => 'pending',
-            'Notes'       => $validated['notes'] ?? null,
-            'CreatedBy'   => $request->user()->id,
+            'Status' => 'pending',
+            'Notes' => $validated['notes'] ?? null,
+            'CreatedBy' => $request->user()->id,
 
-            'BusinessType'   => $validated['businessType'] ?? null,
-            'Emails'         => !empty($emails) ? $emails : null,
-            'Phones'         => !empty($phones) ? $phones : null,
-            'Addresses'      => $validated['addresses'] ?? null,
+            'BusinessType' => $validated['businessType'] ?? null,
+            'Emails' => !empty($emails) ? $emails : null,
+            'Phones' => !empty($phones) ? $phones : null,
+            'Addresses' => $validated['addresses'] ?? null,
             'ContactPersons' => $validated['contactPersons'] ?? null,
-            'GSTNo'          => $validated['gstNo'] ?? null,
-            'PANNo'          => $validated['panNo'] ?? null,
-            'TANNo'          => $validated['tanNo'] ?? null,
+            'GSTNo' => $validated['gstNo'] ?? null,
+            'PANNo' => $validated['panNo'] ?? null,
+            'TANNo' => $validated['tanNo'] ?? null,
         ]);
 
         return response()->json($customer->load('user'), 201);
@@ -268,49 +394,60 @@ class CustomerController extends Controller
         }
 
         $validated = $request->validate([
-            'name'        => 'sometimes|required|string|max:191',
-            'phone'       => 'sometimes|required|string|max:20',
-            'email'       => 'nullable|email|max:191',
-            'type'        => 'sometimes|required|in:retail,wholesale',
-            'district'    => 'sometimes|required|string|max:100',
-            'taluk'       => 'sometimes|required|string|max:100',
-            'address'     => 'nullable|string',
+            'name' => 'sometimes|required|string|max:191',
+            'phone' => 'sometimes|required|string|max:20',
+            'email' => 'nullable|email|max:191',
+            'type' => 'sometimes|required|in:retail,wholesale',
+            'district' => 'sometimes|required|string|max:100',
+            'taluk' => 'sometimes|required|string|max:100',
+            'address' => 'nullable|string',
             'creditLimit' => 'nullable|numeric',
             'maxDiscountPct' => 'nullable|numeric|min:0|max:100',
             'outstanding' => 'nullable|numeric',
-            'status'      => 'sometimes|required|in:approved,pending,declined',
-            'notes'       => 'nullable|string',
+            'status' => 'sometimes|required|in:approved,pending,declined',
+            'notes' => 'nullable|string',
 
             // ── Mobile "Add Customer" parity fields ──────────────────────
-            'businessType'   => 'nullable|string|max:30',
-            'emails'         => 'nullable|array|max:2',
-            'emails.*'       => 'nullable|email|max:191',
-            'phones'         => 'nullable|array|max:2',
-            'phones.*'       => 'nullable|string|max:20',
+            'businessType' => 'nullable|string|max:30',
+            'emails' => 'nullable|array|max:2',
+            'emails.*' => 'nullable|email|max:191',
+            'phones' => 'nullable|array|max:2',
+            'phones.*' => 'nullable|string|max:20',
             'contactPersons' => 'nullable|array|max:2',
-            'contactPersons.*.contactName'  => 'required_with:contactPersons|string|max:191',
+            'contactPersons.*.contactName' => 'required_with:contactPersons|string|max:191',
             'contactPersons.*.contactPhone' => 'required_with:contactPersons|string|max:20',
-            'contactPersons.*.designation'  => 'nullable|string|max:100',
-            'contactPersons.*.email'        => 'nullable|email|max:191',
-            'addresses'      => 'nullable|array|max:2',
-            'addresses.*.address'   => 'required_with:addresses|string|max:255',
-            'addresses.*.address2'  => 'nullable|string|max:255',
-            'addresses.*.city'      => 'required_with:addresses|string|max:100',
+            'contactPersons.*.designation' => 'nullable|string|max:100',
+            'contactPersons.*.email' => 'nullable|email|max:191',
+            'addresses' => 'nullable|array|max:2',
+            'addresses.*.address' => 'required_with:addresses|string|max:255',
+            'addresses.*.address2' => 'nullable|string|max:255',
+            'addresses.*.city' => 'required_with:addresses|string|max:100',
             'addresses.*.stateName' => 'required_with:addresses|string|max:100',
-            'addresses.*.district'  => 'nullable|string|max:100',
-            'addresses.*.country'   => 'required_with:addresses|string|max:100',
-            'addresses.*.pincode'   => 'required_with:addresses|string|max:10',
+            'addresses.*.district' => 'nullable|string|max:100',
+            'addresses.*.country' => 'required_with:addresses|string|max:100',
+            'addresses.*.pincode' => 'required_with:addresses|string|max:10',
             'gstNo' => 'nullable|string|max:15',
             'panNo' => 'nullable|string|max:10',
             'tanNo' => 'nullable|string|max:10',
         ]);
 
         $map = [
-            'name' => 'Name', 'phone' => 'Phone', 'email' => 'Email', 'type' => 'Type',
-            'district' => 'District', 'taluk' => 'Taluk', 'address' => 'Address',
-            'creditLimit' => 'CreditLimit', 'maxDiscountPct' => 'MaxDiscountPct', 'outstanding' => 'Outstanding',
-            'status' => 'Status', 'notes' => 'Notes',
-            'businessType' => 'BusinessType', 'gstNo' => 'GSTNo', 'panNo' => 'PANNo', 'tanNo' => 'TANNo',
+            'name' => 'Name',
+            'phone' => 'Phone',
+            'email' => 'Email',
+            'type' => 'Type',
+            'district' => 'District',
+            'taluk' => 'Taluk',
+            'address' => 'Address',
+            'creditLimit' => 'CreditLimit',
+            'maxDiscountPct' => 'MaxDiscountPct',
+            'outstanding' => 'Outstanding',
+            'status' => 'Status',
+            'notes' => 'Notes',
+            'businessType' => 'BusinessType',
+            'gstNo' => 'GSTNo',
+            'panNo' => 'PANNo',
+            'tanNo' => 'TANNo',
         ];
 
         $update = [];
@@ -321,18 +458,21 @@ class CustomerController extends Controller
         }
 
         if (array_key_exists('emails', $validated)) {
-            $emails = array_values(array_filter($validated['emails'], fn ($e) => !empty($e)));
+            $emails = array_values(array_filter($validated['emails'], fn($e) => !empty($e)));
             $update['Emails'] = !empty($emails) ? $emails : null;
-            if (!empty($emails)) $update['Email'] = $emails[0];
+            if (!empty($emails))
+                $update['Email'] = $emails[0];
         }
         if (array_key_exists('phones', $validated)) {
-            $phones = array_values(array_filter($validated['phones'], fn ($p) => !empty($p)));
+            $phones = array_values(array_filter($validated['phones'], fn($p) => !empty($p)));
             $update['Phones'] = !empty($phones) ? $phones : null;
-            if (!empty($phones)) $update['Phone'] = $phones[0];
+            if (!empty($phones))
+                $update['Phone'] = $phones[0];
         }
         if (array_key_exists('addresses', $validated)) {
             $update['Addresses'] = !empty($validated['addresses']) ? $validated['addresses'] : null;
-            if (!empty($validated['addresses'])) $update['Address'] = $validated['addresses'][0]['address'];
+            if (!empty($validated['addresses']))
+                $update['Address'] = $validated['addresses'][0]['address'];
         }
         if (array_key_exists('contactPersons', $validated)) {
             $update['ContactPersons'] = !empty($validated['contactPersons']) ? $validated['contactPersons'] : null;
@@ -348,9 +488,10 @@ class CustomerController extends Controller
         // in sync whenever these change here.
         if ($customer->user) {
             $userUpdate = [];
-            if (isset($update['Name']))  $userUpdate['name'] = $update['Name'];
+            if (isset($update['Name']))
+                $userUpdate['name'] = $update['Name'];
             if (isset($update['Phone'])) {
-                $userUpdate['phone']    = $update['Phone'];
+                $userUpdate['phone'] = $update['Phone'];
                 $userUpdate['password'] = $update['Phone'];
             }
             if (isset($update['Status'])) {

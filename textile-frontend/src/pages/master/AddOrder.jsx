@@ -4,8 +4,15 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import Layout from "../../components/AppLayout";
 import { getG, G } from "../../theme";
 import API from "../../services/api";
+import { SALE_LOSS_PATH, REJECT_PATH, isSaleLossStatus, isRejectedStatus } from "../../utils/orderStatus";
 
 const getThemeColors = () => getG(localStorage.getItem("premier_theme") === "dark");
+
+// Local (not UTC) yyyy-mm-dd, so "today" is right for IST users too.
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 const Field = ({ label, required, full, children }) => {
@@ -20,8 +27,7 @@ const Field = ({ label, required, full, children }) => {
   );
 };
 
-// Read-only display used when a box is locked (not in Edit mode) — same
-// footprint as an Input/Select so the layout doesn't jump when toggled.
+// Read-only display used when a box is locked (not in Edit mode).
 const ReadField = ({ label, value, full }) => (
   <Field label={label} full={full}>
     <div style={{ width: "100%", boxSizing: "border-box", padding: "9px 13px", borderRadius: 9, border: "1px solid rgba(15,33,56,0.10)", fontSize: 14, color: "#0F2138", background: "#F5F7FA", minHeight: 38, display: "flex", alignItems: "center" }}>
@@ -44,8 +50,6 @@ const Select = ({ children, ...props }) => (
 const TAB_COLORS = ["#1F5C99", "#2E7D32", "#6A3FA0", "#C9740B", "#0E7C86", "#B23A3A"];
 const TAB_ICONS = { blouse: "👚", dhoti: "📜", uniform: "🎽", "uniform shirting": "🎽", "uniform suiting": "🧥", "premier shirting": "👔", pant: "👖", shirt: "👔", leggings: "🩳", bundle: "🧶", hank: "🧵", cone: "🧵", others: "📦" };
 
-// Kept identical to ProductCatalog.jsx / ProductSelection.jsx so the same
-// SubType strings from the backend nest under the same top-level tabs here.
 const TYPE_GROUPS = {
   "Blouse": ["Blouse"],
   "Dhoti": ["Dhoti", "BO Grey - Dhothies", "BO Fabric - Dhothies"],
@@ -74,20 +78,47 @@ function dummyDescription(product, i) {
 }
 
 // Meta keys tucked into OrderDetails alongside the real spec fields —
-// stripped out before treating the rest as an item's saved spec
-// answers. Those answers are kept intact and passed straight back
-// through on submit, even though there's no box on this page to view
-// or edit them anymore (that now lives on Product Selection).
+// stripped out before treating the rest as an item's saved spec answers.
 const META_DETAIL_KEYS = ["GroupRef", "EnquiryOrderNo", "EnquiryOrderDate"];
 
-// ─── Sort No / Shade No — pulled straight from the product record,
-// same convention as ProductSelection.jsx / ProductList.jsx, so the
-// items table below always shows the real DB values, never a guess. ──
 function sortNoFor(product) {
   return product?.SortNo || product?.Code || "—";
 }
+
 function shadeNoFor(product) {
-  return product?.ShadeNo ||"SHADE101" || "—";
+  return product?.ShadeNo || "SHADE101" || "—";
+}
+
+// Real UOM the customer/officer actually picked when placing this line —
+// stored in OrderDetails.UOM. Falls back to the product master's UOM.
+function uomFor(item, product) {
+  return item?.details?.UOM || item?.details?.uom || product?.UOM || null;
+}
+
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
+}
+
+// Builds the OrderDetails object that is saved for one line.
+// Requested Mtr, Allocated Qty and Allocated Mtr all ride along in
+// OrderDetails (no dedicated columns).
+function buildOrderDetails(item, groupRef, form) {
+  const orderDetails = { ...(item.details || {}) };
+
+  if (item.reqMtr) orderDetails.ReqMtr = item.reqMtr;
+  else delete orderDetails.ReqMtr;
+
+  if (item.allocQty !== "" && item.allocQty != null) orderDetails.AllocQty = item.allocQty;
+  else delete orderDetails.AllocQty;
+
+  if (item.allocMtr !== "" && item.allocMtr != null) orderDetails.AllocMtr = item.allocMtr;
+  else delete orderDetails.AllocMtr;
+
+  if (groupRef) orderDetails.GroupRef = groupRef;
+  if (form.enquiryOrderNo) orderDetails.EnquiryOrderNo = form.enquiryOrderNo;
+  if (form.enquiryOrderDate) orderDetails.EnquiryOrderDate = form.enquiryOrderDate;
+  return orderDetails;
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
@@ -104,64 +135,43 @@ export default function AddOrder() {
   const fromEnquiry = searchParams.get("fromEnquiry");
   const prefillCustomerId = searchParams.get("customerId");
   const prefillProductId = searchParams.get("productId");
-  // Editing (or viewing) an existing order via OrderList's 👁️/✏️ buttons.
   const editId = searchParams.get("editId");
-  // 👁️ appends &mode=view — same data-loading path as ✏️, but every
-  // Edit affordance (item Remove, the qty stepper, the bottom action
-  // bar) is hidden and the page can never leave read-only mode.
+  // 👁️ appends &mode=view — every Edit affordance is hidden.
   const viewOnly = !!(editId && searchParams.get("mode") === "view");
-  // A brand-new, manually-created order — not editing/viewing an
-  // existing one, and not converting an approved enquiry (that path
-  // still pre-fills its single product behind the scenes). Only this
-  // case gets the embedded Product Picker below.
   const isNewOrder = !editId && !fromEnquiry;
-
 
   const getStoredCat = () => localStorage.getItem("premier_category") || "cloth";
   const [tab, setTab] = useState(getStoredCat);
   const [subType, setSubType] = useState(() => getStoredCat() === "yarn" ? "bundle" : "dhoti");
-  // itemDiscount / productId / qty / pricePerUnit here are only ever
-  // populated behind the scenes when converting a single-product
-  // enquiry — there's no UI on this page to set them directly anymore.
-  // discount = overall order-level discount (currently unused, kept so
-  // nothing downstream breaks if it's wired back up later).
   const [form, setForm] = useState({ customerId: "", productId: "", qty: "", pricePerUnit: "", deliveryDate: "", notes: "", discount: "", itemDiscount: "", enquiryOrderNo: "", enquiryOrderDate: "" });
-  // Spec answers (Dhoti Type, Length, Colour, etc.) carried over from a
-  // source enquiry so they aren't lost on save — there's no box on this
-  // page to view/edit them anymore, they just ride along silently.
   const [draftDetails, setDraftDetails] = useState(null);
 
-  // Multiple products can belong to a single order. `items` holds
-  // everything already on the order; quantities can still be adjusted
-  // per-row and rows can be removed. For a brand-new order, products
-  // are added via the embedded Product Picker below; when converting
-  // an enquiry they still arrive pre-filled behind the scenes.
+  // The delivery date the order had when it was loaded. Old orders may
+  // already carry a past date; we only reject a past date the user has
+  // CHANGED it to, so those orders can still be updated.
+  const [originalDeliveryDate, setOriginalDeliveryDate] = useState("");
+
   const [items, setItems] = useState([]);
-  // When editing (editId), items pulled in from the backend carry a
-  // `dbId` — the real Order row id — so Submit can PUT them instead of
-  // creating duplicates. removedItemIds tracks existing rows the user
-  // removed from the list, so Submit can actually delete them.
   const [removedItemIds, setRemovedItemIds] = useState([]);
-  // If the order being edited already belongs to a group (multi-product
-  // order), keep using that same GroupRef instead of minting a new one.
   const [existingGroupRef, setExistingGroupRef] = useState(null);
-  // Which row (by tempId) currently has its Qty cell in direct-typing
-  // Edit mode, as opposed to the default +/- stepper.
+  // Which row (by tempId) is in Edit mode. Only that row shows the
+  // Allocated Qty / Allocated Mtr inputs; every other row is read-only.
   const [editingQtyId, setEditingQtyId] = useState(null);
+
+  // Allocation stage of the order being edited (null until loaded).
+  // Same stage names as OrderList.jsx: pending_allocation | partial_allocation |
+  // fully_allocated | approved | erp_transfer
+  const [allocStage, setAllocStage] = useState(null);
+  // Products ticked (checkbox before S.No) to send to Sale Loss / Reject.
+  const [selectedIds, setSelectedIds] = useState([]);
 
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  // Payment & Delivery arrives pre-filled from the approved enquiry (or
-  // an order being edited/viewed), so it starts locked (read-only) —
-  // staff click "Edit" to change it. View mode (viewOnly) always stays
-  // locked — see the effect below.
   const [editPayment, setEditPayment] = useState(!fromEnquiry && !editId);
 
-  // View mode can never unlock, even if something else calls the
-  // setter above — pin it closed whenever viewOnly is true.
   useEffect(() => {
     if (viewOnly) setEditPayment(false);
     // eslint-disable-next-line
@@ -186,29 +196,83 @@ export default function AddOrder() {
         setProducts(prodRes.data);
 
         if (editId) {
-          // ── Editing or viewing an existing order (from OrderList) ──
-          // Fetch the order itself, then — if it's part of a grouped
-          // multi-product order — fetch every sibling row sharing the
-          // same GroupRef, so the whole order (not just this one row)
-          // shows up in the "Products in this Order" table below.
           try {
             const orderRes = await API.get(`/orders/${editId}`);
             const orderData = orderRes.data;
             const groupRef = orderData.OrderDetails?.GroupRef || null;
             setExistingGroupRef(groupRef);
 
+            // ── Allocation data (same sources as OrderList.jsx / Batches.jsx) ──
+            // End User  -> AllocationSummary on GET /orders (they can't read the board)
+            // Admin     -> /allocations/board (real allocation / approval / ERP data)
+            const isEndUserRole = role === "end_user";
+            const allocByOrderId = {};
+            let listRows = [];
+            try {
+              const listParams = isEndUserRole
+                ? { scope: "own", with_allocation: 1 }
+                : role === "admin" ? { scope: "own_and_team" } : {};
+              const allRes = await API.get("/orders", { params: listParams });
+              listRows = allRes.data || [];
+              listRows.forEach((o) => {
+                if (o.AllocationSummary) allocByOrderId[o.Id] = { ...o.AllocationSummary, orderedQty: o.Quantity };
+              });
+            } catch { /* fall back to whatever we have */ }
+
+            if (!isEndUserRole) {
+              try {
+                const boardRes = await API.get("/allocations/board");
+                (boardRes.data?.products || []).forEach((p) => {
+                  (p.customers || []).forEach((c) => { if (c.orderId) allocByOrderId[c.orderId] = c; });
+                });
+              } catch { /* board unavailable → keep the summary data */ }
+            }
+
             let groupRows = [orderData];
             if (groupRef) {
-              const allRes = await API.get("/orders");
-              const siblings = (allRes.data || []).filter((o) => o.OrderDetails?.GroupRef === groupRef);
+              // Only show the products in the SAME state as the one opened:
+              // opened from Sale Loss -> only its sale-loss products,
+              // opened from Reject -> only rejected ones,
+              // opened from Order List -> only the still-open ones.
+              const kindOf = (st) => (isSaleLossStatus(st) ? "sale_loss" : isRejectedStatus(st) ? "rejected" : "open");
+              const myKind = kindOf(orderData.Status);
+              const siblings = listRows.filter(
+                (o) => o.OrderDetails?.GroupRef === groupRef && kindOf(o.Status) === myKind
+              );
               if (siblings.length > 0) groupRows = siblings;
             }
+
+            // ── Allocation stage (same rule as OrderList.jsx computeStage) ──
+            let ordered = 0, allocated = 0, allApproved = true, allErp = true;
+            groupRows.forEach((o) => {
+              const a = allocByOrderId[o.Id];
+              ordered += a ? (parseFloat(a.orderedQty) || 0) : (parseFloat(o.Quantity) || 0);
+              const usable = a && a.status !== "rejected";
+              const saved = usable ? (parseFloat(a.allocatedQty) || 0) : 0;
+              allocated += saved;
+              if (!(usable && saved > 0 && a.status === "approved")) allApproved = false;
+              if (!(usable && saved > 0 && a.erpStatus === "erp_so_created")) allErp = false;
+            });
+            setAllocStage(
+              allocated <= 0 ? "pending_allocation"
+                : allocated < ordered ? "partial_allocation"
+                  : allErp ? "erp_transfer"
+                    : allApproved ? "approved"
+                      : "fully_allocated"
+            );
 
             const builtItems = groupRows.map((o) => {
               const productId = o.ProductId ?? o.product?.Id ?? o.Product ?? "";
               const product = o.product || prodRes.data.find((p) => String(p.Id) === String(productId));
               const rawDetails = { ...(o.OrderDetails || {}) };
               META_DETAIL_KEYS.forEach((k) => delete rawDetails[k]);
+
+              // Real allocation counts only when something is actually allocated
+              const a = allocByOrderId[o.Id];
+              const hasReal = !!a && a.status !== "rejected" && (parseFloat(a.allocatedQty) || 0) > 0;
+              const realQty = hasReal ? a.allocatedQty : "";
+              const realMtr = hasReal ? (a.meters ?? "") : "";
+
               return {
                 tempId: `existing-${o.Id}`,
                 dbId: o.Id,
@@ -219,6 +283,15 @@ export default function AddOrder() {
                 qty: o.Quantity,
                 pricePerUnit: o.PricePerUnit,
                 discount: o.DiscountPct || 0,
+                remarks: rawDetails.Remarks || rawDetails.remarks || "",
+                reqMtr: rawDetails.ReqMtr || "",
+                // Real allocation wins; OrderDetails is only a fallback
+                allocQty: hasReal ? realQty : (rawDetails.AllocQty ?? ""),
+                allocMtr: hasReal ? realMtr : (rawDetails.AllocMtr ?? ""),
+                // Remember the loaded values so we only send changes on save
+                origAllocQty: hasReal ? String(realQty) : "",
+                origAllocMtr: hasReal ? String(realMtr) : "",
+                allocMeta: { cdFlag: a?.cdFlag ? 1 : 0, priceListCode: a?.priceListCode || null },
                 details: Object.keys(rawDetails).length ? rawDetails : null,
               };
             });
@@ -229,6 +302,9 @@ export default function AddOrder() {
             setTab(first.Category);
             setSubType(first.SubType);
 
+            const loadedDelivery = first.DeliveryDate ? first.DeliveryDate.substring(0, 10) : "";
+            setOriginalDeliveryDate(loadedDelivery);
+
             setForm((f) => ({
               ...f,
               customerId: first.CustomerId ?? first.customer?.Id ?? "",
@@ -236,7 +312,7 @@ export default function AddOrder() {
               qty: "",
               pricePerUnit: "",
               itemDiscount: "",
-              deliveryDate: first.DeliveryDate ? first.DeliveryDate.substring(0, 10) : "",
+              deliveryDate: loadedDelivery,
               notes: first.Notes || "",
               enquiryOrderNo: first.OrderDetails?.EnquiryOrderNo || first.Code || "",
               enquiryOrderDate: first.OrderDetails?.EnquiryOrderDate || (first.CreatedAt ? first.CreatedAt.substring(0, 10) : ""),
@@ -245,18 +321,8 @@ export default function AddOrder() {
             setError("Failed to load this order.");
           }
         } else if (fromEnquiry && prefillProductId) {
-          // Coming from an approved Order Enquiry — pre-fill customer,
-          // product, category/sub-type and starting price so staff only
-          // has to confirm delivery details before placing the order.
           const p = prodRes.data.find((pr) => String(pr.Id) === String(prefillProductId));
 
-          // Pull the source enquiry's own order number, quantity, price,
-          // discount, saved spec answers, and delivery date / remarks so
-          // the whole draft is genuinely pre-filled with whatever was
-          // entered before — not just customer/product. If the fetch
-          // fails, fall back to an auto-generated order number and leave
-          // the rest for staff to fill in manually. Date always defaults
-          // to today — the day this order is actually being placed.
           let enquiryCode = "", enquiryQty = "", enquiryPrice = p ? p.Price : "", enquiryDiscount = "";
           let enquiryDetails = null, enquiryDeliveryDate = "", enquiryNotes = "";
           try {
@@ -278,6 +344,9 @@ export default function AddOrder() {
             setSubType(p.SubType);
           }
           setDraftDetails(enquiryDetails || null);
+          // The enquiry's delivery date is the "original" one — don't block
+          // it just because it has since passed; only a NEW past date.
+          setOriginalDeliveryDate(enquiryDeliveryDate ? String(enquiryDeliveryDate).substring(0, 10) : "");
 
           setForm((f) => ({
             ...f,
@@ -286,16 +355,12 @@ export default function AddOrder() {
             qty: enquiryQty || f.qty,
             pricePerUnit: enquiryPrice || f.pricePerUnit,
             itemDiscount: enquiryDiscount || f.itemDiscount,
-            deliveryDate: enquiryDeliveryDate || f.deliveryDate,
+            deliveryDate: enquiryDeliveryDate ? String(enquiryDeliveryDate).substring(0, 10) : f.deliveryDate,
             notes: enquiryNotes || f.notes,
             enquiryOrderNo: enquiryCode,
             enquiryOrderDate: today,
           }));
         } else {
-          // No source enquiry, not editing/viewing — this is a manual
-          // "+ Add Enquiry" entry. Still auto-generate an order number
-          // and default the date to today, same as the enquiry-
-          // conversion path, so both flows present consistently.
           const today = new Date().toISOString().substring(0, 10);
           setForm((f) => ({
             ...f,
@@ -314,9 +379,6 @@ export default function AddOrder() {
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  // Turn whatever's still sitting in the hidden draft fields into an
-  // item, if there is one — only ever populated behind the scenes when
-  // converting a single-product enquiry. Returns null otherwise.
   const buildDraftItem = () => {
     if (!form.productId || !form.qty || !form.pricePerUnit) return null;
     const product = products.find((pr) => String(pr.Id) === String(form.productId));
@@ -330,6 +392,9 @@ export default function AddOrder() {
       qty: form.qty,
       pricePerUnit: form.pricePerUnit,
       discount: form.itemDiscount || 0,
+      reqMtr: "",
+      allocQty: "",
+      allocMtr: "",
       details: draftDetails ? { ...draftDetails } : null,
     };
   };
@@ -342,17 +407,7 @@ export default function AddOrder() {
     });
   };
 
-  const handleUpdateQty = (tempId, delta) => {
-    setItems((prev) => prev.map((i) => {
-      if (i.tempId !== tempId) return i;
-      const next = Math.max(1, (parseInt(i.qty, 10) || 0) + delta);
-      return { ...i, qty: next };
-    }));
-  };
-
-  // ── Embedded Product Picker — grouping / search / add (mirrors
-  // ProductSelection.jsx, scoped to this order's locked category and
-  // writing straight into `items` instead of a separate cart). ──
+  // ── Embedded Product Picker — grouping / search / add ──
   const categoryProducts = useMemo(() => products.filter((p) => p.Category === tab), [products, tab]);
 
   const pickerSubTypes = useMemo(
@@ -429,8 +484,6 @@ export default function AddOrder() {
       .filter((p) => pickerUomFilter === "All" || dummyUom(p.SubType) === pickerUomFilter);
   }, [categoryProducts, pickerSubType, pickerNameQuery, pickerSecondaryQuery, pickerUomFilter]);
 
-  // How much of a product is already on this order (added via the
-  // picker below, or already present as an item).
   const inOrderQty = (productId) => items.find((i) => String(i.productId) === String(productId))?.qty || 0;
   const getPickerRowQty = (id) => (pickerRowQty[id] !== undefined ? pickerRowQty[id] : inOrderQty(id));
   const setPickerRowQtyFor = (product, qty) => {
@@ -438,8 +491,6 @@ export default function AddOrder() {
     setPickerRowQty((prev) => ({ ...prev, [product.Id]: Math.max(0, Math.min(qty, cap || qty)) }));
   };
 
-  // Adds (or updates the qty of) a product on this order. Doesn't touch
-  // a backend cart — this order isn't saved until "Place Order" below.
   const handlePickerAdd = (product) => {
     const qty = getPickerRowQty(product.Id);
     if (qty <= 0) return;
@@ -460,6 +511,9 @@ export default function AddOrder() {
         qty,
         pricePerUnit: product.Price || 0,
         discount: 0,
+        reqMtr: "",
+        allocQty: "",
+        allocMtr: "",
         details: null,
       }];
     });
@@ -475,8 +529,14 @@ export default function AddOrder() {
       return;
     }
 
-    // Whatever is still sitting in the hidden draft fields counts as
-    // one more item (single-product enquiry conversion case).
+    // Past delivery dates are blocked. The `min` on the input only greys
+    // out the picker (typing by hand can bypass it), so check here too —
+    // but let an untouched, already-past date on an existing order through.
+    if (form.deliveryDate && form.deliveryDate < todayStr() && form.deliveryDate !== originalDeliveryDate) {
+      setError("Expected Delivery Date cannot be in the past.");
+      return;
+    }
+
     const draftItem = buildDraftItem();
     const finalItems = draftItem ? [...items, draftItem] : items;
 
@@ -488,10 +548,6 @@ export default function AddOrder() {
     setSaving(true);
     try {
       if (editId) {
-        // ── Editing an existing order ──
-        // Existing rows (item.dbId set) are updated in place with PUT;
-        // anything the user removed from the list is actually deleted
-        // so it doesn't linger on the backend.
         const groupRef = existingGroupRef || (finalItems.length > 1 ? `GRP-${Date.now()}` : null);
 
         for (const id of removedItemIds) {
@@ -499,10 +555,7 @@ export default function AddOrder() {
         }
 
         for (const item of finalItems) {
-          const orderDetails = { ...(item.details || {}) };
-          if (groupRef) orderDetails.GroupRef = groupRef;
-          if (form.enquiryOrderNo) orderDetails.EnquiryOrderNo = form.enquiryOrderNo;
-          if (form.enquiryOrderDate) orderDetails.EnquiryOrderDate = form.enquiryOrderDate;
+          const orderDetails = buildOrderDetails(item, groupRef, form);
 
           const payload = {
             customerId: form.customerId,
@@ -517,37 +570,43 @@ export default function AddOrder() {
 
           if (item.dbId) {
             await API.put(`/orders/${item.dbId}`, payload);
+
+            // Admin: push a changed Allocated Qty / Mtr to the real allocation
+            // (same endpoint Batches.jsx uses), so Marketing Review stays in sync.
+            const newQty = Number(item.allocQty) || 0;
+            const changed =
+              String(item.allocQty ?? "") !== String(item.origAllocQty ?? "") ||
+              String(item.allocMtr ?? "") !== String(item.origAllocMtr ?? "");
+            if (role === "admin" && newQty > 0 && changed) {
+              if (newQty > Number(item.qty)) {
+                throw { response: { data: { message: `Allocated Qty (${newQty}) cannot be more than Requested Qty (${item.qty}).` } } };
+              }
+              await API.post("/allocations", {
+                productId: item.productId,
+                allocations: [{
+                  orderId: item.dbId,
+                  customerId: form.customerId,
+                  allocatedQty: newQty,
+                  meters: item.allocMtr || "",
+                  cdFlag: item.allocMeta?.cdFlag ?? 0,
+                  priceListCode: item.allocMeta?.priceListCode ?? null,
+                }],
+              });
+            }
           } else {
             await API.post("/orders", payload);
           }
         }
       } else {
-        // ── Placing a new order (manual entry or converting an enquiry) ──
-        // Multiple products in one order are still separate Order rows
-        // under the hood, tagged with a shared GroupRef so they display,
-        // edit and delete together as one order everywhere in the app.
         const groupRef = finalItems.length > 1 ? `GRP-${Date.now()}` : null;
 
-        // Coming from an approved enquiry: that enquiry IS this order —
-        // update its own row in place with the confirmed details rather
-        // than creating a brand new row and leaving the original
-        // enquiry stranded behind it. Only the first item does this;
-        // any further items are still new rows sharing the GroupRef,
-        // same as a normal multi-product order.
         let first = true;
         for (const item of finalItems) {
-          const orderDetails = { ...(item.details || {}) };
-          if (groupRef) orderDetails.GroupRef = groupRef;
-          if (form.enquiryOrderNo) orderDetails.EnquiryOrderNo = form.enquiryOrderNo;
-          if (form.enquiryOrderDate) orderDetails.EnquiryOrderDate = form.enquiryOrderDate;
+          const orderDetails = buildOrderDetails(item, groupRef, form);
 
           if (fromEnquiry && first) {
-            // O2C Step 4 — Marketing (admin/end_user) places the order but
-            // the Marketing Head (system_admin) gives the real, final
-            // approval. So this submit only sets status="approved" when the
-            // Marketing Head themselves is the one placing/finalizing it;
-            // otherwise it stays "assigned" (placed, dated — just waiting
-            // in the Final Approval queue).
+            // O2C Step 4 — only the Marketing Head (system_admin) gives the
+            // final approval; otherwise the order stays "assigned".
             await API.put(`/orders/${fromEnquiry}`, {
               qty: item.qty,
               pricePerUnit: item.pricePerUnit,
@@ -581,6 +640,42 @@ export default function AddOrder() {
     }
   };
 
+  // Sale Loss / Reject (edit mode only, and only while the order is still
+  // Pending / Partial Allocation — see canCloseOrder below).
+  // Asks for a reason, then calls /orders/close ONCE for all lines of the
+  // order, and opens the matching page.
+  //   kind = "sale_loss" -> Sale Loss page   |   "rejected" -> Reject page
+  const markOrder = async (kind) => {
+    const isLoss = kind === "sale_loss";
+    const pickedIds = items.filter((i) => i.dbId && selectedIds.includes(i.dbId)).map((i) => i.dbId);
+    if (pickedIds.length === 0) {
+      setError(`Tick at least one product (checkbox before S.No) to send it to ${isLoss ? "Sale Loss" : "Reject"}.`);
+      return;
+    }
+    const countText = `${pickedIds.length} product${pickedIds.length === 1 ? "" : "s"}`;
+    const reason = window.prompt(isLoss ? `Reason for Sale Loss? (${countText})` : `Reason for rejecting? (${countText})`);
+    if (reason === null) return; // cancelled
+    if (!reason.trim()) {
+      setError("Please enter a reason.");
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+    try {
+      await API.patch("/orders/close", {
+        kind,
+        reason: reason.trim(),
+        ids: pickedIds,
+      });
+      navigate(isLoss ? SALE_LOSS_PATH : REJECT_PATH);
+    } catch (err) {
+      setError(err.response?.data?.message || "Failed to update order.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (loading) {
     return (
       <Layout pageTitle={viewOnly ? "View Order" : editId ? "Edit Order" : "Add Order"}>
@@ -589,21 +684,24 @@ export default function AddOrder() {
     );
   }
 
+  const tdBase = { padding: "11px 12px", fontSize: 13, borderBottom: `1px solid ${themeG.border}`, textAlign: "center" };
+  const editInputStyle = { padding: "5px 6px", textAlign: "center", borderRadius: 7, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: "inherit", color: themeG.textMain, background: themeG.card, outline: "none", boxSizing: "border-box" };
+
+  // Sale Loss / Reject are allowed only before the order is fully allocated
+  // (Pending Allocation or Partial Allocation). Hidden for Fully Allocated,
+  // Approved and ERP Transfer.
+  const canCloseOrder = allocStage === "pending_allocation" || allocStage === "partial_allocation";
+
+  // Checkbox column (before S.No) — only where Sale Loss / Reject are available.
+  const showPick = !viewOnly && !!editId && canCloseOrder;
+  const pickable = items.filter((i) => i.dbId);
+  const allPicked = pickable.length > 0 && pickable.every((i) => selectedIds.includes(i.dbId));
+
   return (
     <Layout pageTitle={viewOnly ? "View Order" : editId ? "Edit Order" : "Add Order"}>
 
-      {/* ── Category locked badge ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 18px", borderRadius: 10, background: themeG.card, border: `1px solid ${themeG.border}`, boxShadow: "0 2px 8px rgba(46,122,114,0.06)" }}>
-          <span style={{ fontSize: 18 }}>{tab === "cloth" ? "👘" : "🧵"}</span>
-          <span style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 700, color: themeG.textMain }}>{tab === "cloth" ? "Cloth" : "Yarn"}</span>
-        </div>
-        {/* {!viewOnly && (
-          <span style={{ fontSize: 12, color: themeG.textSub }}>
-            Category locked — <span style={{ color: themeG.accent, cursor: "pointer", textDecoration: "underline" }}
-              onClick={() => navigate("/select-category")}>Switch category</span>
-          </span>
-        )} */}
+        {/* Category locked badge — hidden */}
       </div>
 
       {fromEnquiry && !editId && (
@@ -616,7 +714,7 @@ export default function AddOrder() {
         <div style={{ marginBottom: 20, background: "rgba(91,155,217,0.08)", border: "1px solid rgba(91,155,217,0.25)", borderRadius: 10, padding: "10px 16px", fontSize: 13, color: "#1F5C99", fontWeight: 600 }}>
           {viewOnly
             ? `Viewing order ${form.enquiryOrderNo || `#${editId}`} — read-only.`
-            : `Editing order ${form.enquiryOrderNo || `#${editId}`} — everything below is pre-filled from the existing order. Click "Edit" on Payment & Delivery to change it, then Update Order.`}
+            : `Editing order ${form.enquiryOrderNo || `#${editId}`} — everything below is read-only until you click "Edit" on a row (or on Payment & Delivery), then Update Order.`}
         </div>
       )}
 
@@ -628,10 +726,7 @@ export default function AddOrder() {
           </div>
         )}
 
-        {/* ── 1. Order Details — Enquiry Order No / Date are always
-              read-only (pre-filled). Customer is editable unless the
-              order is being viewed (viewOnly), in which case it shows
-              read-only too. ── */}
+        {/* ── 1. Order Details ── */}
         <div style={card}>
           <h3 style={{ ...cardTitle }}>Order Details</h3>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "4px 20px", alignItems: "start" }}>
@@ -656,11 +751,7 @@ export default function AddOrder() {
           </div>
         </div>
 
-        {/* ── 2. Select Products — brand-new manual orders only. Same
-              tabs → sub-tabs → combined name search → secondary
-              search/UOM → table + qty stepper + Add pattern as the
-              Product Selection page, writing straight into `items`
-              since there's no separate cart step on this page. ── */}
+        {/* ── 2. Select Products — brand-new manual orders only ── */}
         {isNewOrder && !viewOnly && (
           <div style={card}>
             <h3 style={cardTitle}>Select Products</h3>
@@ -753,7 +844,7 @@ export default function AddOrder() {
                     <thead>
                       <tr>
                         {["Sort No", "Shade No", "Product Description", "Type", "UOM", "Colour", "Quantity"].map((h) => (
-                          <th key={h} style={{ textAlign: "left", padding: "10px 14px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em",  color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0 }}>{h}</th>
+                          <th key={h} style={{ textAlign: "left", padding: "10px 14px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0 }}>{h}</th>
                         ))}
                       </tr>
                     </thead>
@@ -801,95 +892,141 @@ export default function AddOrder() {
           </div>
         )}
 
-        {/* ── 3. Products in this order — full width, easy to scan.
-              For a new order, rows land here via the picker above; for
-              edit/view they're loaded straight from the backend as
-              before. Sort No / Shade No come straight from the product
-              record. ── */}
+        {/* ── 3. Products in this order ──
+              Read-only by default. Requested Qty is always the original
+              ordered quantity (never editable here). Click a row's Edit to
+              turn Allocated Qty / Allocated Mtr into inputs for that row only.
+              Click Done to go back to plain text showing the edited value,
+              then Update Order to save. */}
         {items.length > 0 && (
           <div style={card}>
             <h3 style={cardTitle}>Products in this Order ({items.length})</h3>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr>
-                  {(viewOnly
-                    ? ["S.No", "Sort No", "Shade No", "Product", "Sub-type", "Qty"]
-                    : ["S.No", "Sort No", "Shade No", "Product", "Sub-type", "Qty", "Actions"]
-                  ).map(h => (
-                    <th key={h} style={{ textAlign: "left", fontSize: 11,color: "#FFFFFF", background: "#1F3A63", padding: "10px 12px", borderBottom: `2px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700 }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((i, idx) => {
-                  const product = products.find((p) => String(p.Id) === String(i.productId));
-                  return (
-                    <tr key={i.tempId}>
-                      <td style={{ padding: "11px 12px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}` }}>{idx + 1}</td>
-                      <td style={{ padding: "11px 12px", fontSize: 13, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` }}>{sortNoFor(product)}</td>
-                      <td style={{ padding: "11px 12px", fontSize: 13, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` }}>{shadeNoFor(product)}</td>
-                      <td style={{ padding: "11px 12px", fontSize: 13, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` }}>{i.productLabel}</td>
-                      <td style={{ padding: "11px 12px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}`, textTransform: "capitalize" }}>{i.subType}</td>
-                      <td style={{ padding: "11px 12px", fontSize: 13, borderBottom: `1px solid ${themeG.border}` }}>
-                        {viewOnly ? (
-                          <span style={{ fontWeight: 600 }}>{i.qty}</span>
-                        ) : editingQtyId === i.tempId ? (
-                          <input
-                            type="number"
-                            min={1}
-                            value={i.qty}
-                            onChange={(e) => {
-                              const v = Math.max(1, parseInt(e.target.value, 10) || 1);
-                              setItems((prev) => prev.map((it) => it.tempId === i.tempId ? { ...it, qty: v } : it));
-                            }}
-                            style={{ width: 70, padding: "6px 8px", borderRadius: 7, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: "inherit", color: themeG.textMain, background: themeG.card, outline: "none", boxSizing: "border-box" }}
-                          />
-                        ) : (
-                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                            <button type="button" onClick={() => handleUpdateQty(i.tempId, -1)}
-                              style={{ width: 24, height: 24, borderRadius: 6, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, cursor: "pointer", fontSize: 14, fontWeight: 700, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              −
-                            </button>
-                            <span style={{ minWidth: 24, textAlign: "center", fontWeight: 600 }}>{i.qty}</span>
-                            <button type="button" onClick={() => handleUpdateQty(i.tempId, 1)}
-                              style={{ width: 24, height: 24, borderRadius: 6, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, cursor: "pointer", fontSize: 14, fontWeight: 700, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              +
-                            </button>
-                          </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    {showPick && (
+                      <th style={{ textAlign: "center", background: "#1F3A63", padding: "10px 12px", borderBottom: `2px solid ${themeG.border}`, width: 40 }}>
+                        <input
+                          type="checkbox"
+                          title="Select all products"
+                          checked={allPicked}
+                          onChange={(e) => setSelectedIds(e.target.checked ? pickable.map((i) => i.dbId) : [])}
+                          style={{ width: 16, height: 16, cursor: "pointer" }}
+                        />
+                      </th>
+                    )}
+                    {(viewOnly
+                      ? ["S.No", "Sort No", "Shade", "Product", "UOM", "Sub-type", "Remarks", "Requested Qty", "Allocated Qty", "Allocated Mtr"]
+                      : ["S.No", "Sort No", "Shade", "Product", "UOM", "Sub-type", "Remarks", "Requested Qty", "Allocated Qty", "Allocated Mtr", "Actions"]
+                    ).map(h => (
+                      <th key={h} style={{ textAlign: "center", fontSize: 11, color: "#FFFFFF", background: "#1F3A63", padding: "10px 12px", borderBottom: `2px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((i, idx) => {
+                    const product = products.find((p) => String(p.Id) === String(i.productId));
+                    const isEditing = !viewOnly && editingQtyId === i.tempId;
+                    return (
+                      <tr key={i.tempId} style={showPick && selectedIds.includes(i.dbId) ? { background: "rgba(178,58,58,0.06)" } : undefined}>
+                        {showPick && (
+                          <td style={tdBase}>
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.includes(i.dbId)}
+                              onChange={(e) =>
+                                setSelectedIds((prev) =>
+                                  e.target.checked ? [...prev, i.dbId] : prev.filter((x) => x !== i.dbId)
+                                )
+                              }
+                              style={{ width: 16, height: 16, cursor: "pointer" }}
+                            />
+                          </td>
                         )}
-                      </td>
-                      {!viewOnly && (
-                        <td style={{ padding: "11px 12px", borderBottom: `1px solid ${themeG.border}` }}>
-                          <div style={{ display: "flex", gap: 6 }}>
-                            <button onClick={() => setEditingQtyId((prev) => prev === i.tempId ? null : i.tempId)}
-                              style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${themeG.accent}55`, background: `${themeG.accent}14`, color: themeG.accent, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
-                              {editingQtyId === i.tempId ? "Done" : "Edit"}
-                            </button>
-                            <button onClick={() => handleRemoveItem(i.tempId)}
-                              style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(178,58,58,0.30)", background: "rgba(178,58,58,0.06)", color: "#B23A3A", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
-                              Remove
-                            </button>
-                          </div>
+                        <td style={{ ...tdBase, color: themeG.textSub }}>{idx + 1}</td>
+                        <td style={{ ...tdBase, color: themeG.textMain }}>{sortNoFor(product)}</td>
+                        <td style={{ ...tdBase, color: themeG.textMain }}>{shadeNoFor(product)}</td>
+                        <td style={{ ...tdBase, color: themeG.textMain }}>{i.productLabel}</td>
+                        <td style={{ ...tdBase, color: themeG.textMain }}>{(() => { const u = uomFor(i, product); return u ? uomLabel(u) : "—"; })()}</td>
+                        <td style={{ ...tdBase, color: themeG.textSub, textTransform: "capitalize" }}>{i.subType}</td>
+                        <td style={{ ...tdBase, color: themeG.textSub }}>{i.remarks || "—"}</td>
+
+                        {/* Requested Qty — original ordered quantity, always read-only */}
+                        <td style={tdBase}>
+                          <span style={{ fontWeight: 600, color: themeG.textMain }}>{i.qty}</span>
                         </td>
-                      )}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+
+                        {/* Allocated Qty — becomes an input while this row is in Edit mode */}
+                        <td style={tdBase}>
+                          {isEditing ? (
+                            <input
+                              type="number"
+                              min={0}
+                              max={i.qty}
+                              value={i.allocQty ?? ""}
+                              onChange={(e) =>
+                                setItems((prev) =>
+                                  prev.map((it) => it.tempId === i.tempId ? { ...it, allocQty: e.target.value } : it)
+                                )
+                              }
+                              style={{ ...editInputStyle, width: 80 }}
+                            />
+                          ) : (
+                            <span style={{ color: themeG.textMain }}>{i.allocQty || "—"}</span>
+                          )}
+                        </td>
+
+                        {/* Allocated Mtr — becomes an input while this row is in Edit mode */}
+                        <td style={tdBase}>
+                          {isEditing ? (
+                            <input
+                              type="text"
+                              placeholder="e.g. 5M"
+                              value={i.allocMtr ?? ""}
+                              onChange={(e) =>
+                                setItems((prev) =>
+                                  prev.map((it) => it.tempId === i.tempId ? { ...it, allocMtr: e.target.value } : it)
+                                )
+                              }
+                              style={{ ...editInputStyle, width: 80 }}
+                            />
+                          ) : (
+                            <span style={{ color: themeG.textMain }}>{i.allocMtr || "—"}</span>
+                          )}
+                        </td>
+
+                        {!viewOnly && (
+                          <td style={tdBase}>
+                            <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
+                              <button onClick={() => setEditingQtyId((prev) => prev === i.tempId ? null : i.tempId)}
+                                style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${themeG.accent}55`, background: `${themeG.accent}14`, color: themeG.accent, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
+                                {isEditing ? "Done" : "Edit"}
+                              </button>
+                              <button onClick={() => handleRemoveItem(i.tempId)}
+                                style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(178,58,58,0.30)", background: "rgba(178,58,58,0.06)", color: "#B23A3A", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
+                                Remove
+                              </button>
+                            </div>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
 
-        {/* ── 4. Payment & Delivery — Expected Delivery Date and
-              Remarks. Locked until Edit — and in view mode, the Edit
-              button is hidden entirely so it stays permanently
-              read-only. ── */}
+        {/* ── 4. Payment & Delivery — locked until Edit ── */}
         <div style={card}>
           <h3 style={{ ...cardTitle }}>Payment & Delivery</h3>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: "4px 20px", alignItems: "start" }}>
             {editPayment ? (
-              <Field label="Expected Delivery Date">
-                <Input type="date" value={form.deliveryDate} onChange={e => set("deliveryDate", e.target.value)} />
+              <Field label="Expected Delivery Date" required>
+                {/* min = today → past days are disabled in the picker */}
+                <Input type="date" min={todayStr()} value={form.deliveryDate} onChange={e => set("deliveryDate", e.target.value)} />
               </Field>
             ) : (
               <ReadField label="Expected Delivery Date" value={form.deliveryDate || "—"} />
@@ -934,14 +1071,14 @@ export default function AddOrder() {
         )}
 
         {!viewOnly && !editId && (
-          <button onClick={handleSubmit} disabled={saving}
+          <button onClick={handleSubmit} disabled={saving} data-confirm="Approve and place this order?" data-confirm-title="Approve Order"
             style={{ padding: "10px 24px", borderRadius: 9, border: `1.5px solid ${themeG.accent}`, background: "transparent", color: themeG.accent, cursor: saving ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 700, opacity: saving ? 0.6 : 1 }}>
             {saving ? "…" : "Approve"}
           </button>
         )}
 
         {!viewOnly && (
-          <button onClick={handleSubmit} disabled={saving}
+          <button onClick={handleSubmit} disabled={saving} data-confirm="Submit this order to the next person for approval?" data-confirm-title="Submit Order"
             style={{ padding: "10px 28px", borderRadius: 9, border: "none", background: themeG.accent, color: themeG.card, cursor: saving ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 700, boxShadow: "0 2px 10px rgba(91,155,217,0.32)", opacity: saving ? 0.6 : 1 }}>
             {saving
               ? (editId ? "Updating…" : "Placing…")
@@ -949,6 +1086,22 @@ export default function AddOrder() {
                 ? "Update Order"
                 : `Place Order${(items.length + (form.productId ? 1 : 0)) > 1 ? ` (${items.length + (form.productId ? 1 : 0)} products)` : ""}`}
           </button>
+        )}
+
+        {/* Sale Loss / Reject — edit mode only, and ONLY while the order is
+            Pending Allocation or Partial Allocation. Each asks for a reason,
+            marks the order and opens its own page (Sale Loss / Reject list). */}
+        {!viewOnly && editId && canCloseOrder && (
+          <>
+            <button type="button" disabled={saving} onClick={() => markOrder("sale_loss")}
+              style={{ padding: "10px 24px", borderRadius: 9, border: "1.5px solid #C2571A", background: "transparent", color: "#C2571A", cursor: saving ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 700, opacity: saving ? 0.6 : 1 }}>
+              Sale Loss
+            </button>
+            <button type="button" disabled={saving} onClick={() => markOrder("rejected")}
+              style={{ padding: "10px 24px", borderRadius: 9, border: "1.5px solid #B23A3A", background: "transparent", color: "#B23A3A", cursor: saving ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 700, opacity: saving ? 0.6 : 1 }}>
+              Reject
+            </button>
+          </>
         )}
       </div>
     </Layout>

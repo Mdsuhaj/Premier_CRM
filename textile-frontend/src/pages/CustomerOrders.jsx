@@ -62,7 +62,7 @@ import API from "../services/api";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-const TABLE_HEADERS = ["S.No", "Order No", "Date", "Customer Name", "Sub Type", "Product Name", "Qty", "Following Person", "Delivery Date", "Status"];
+const TABLE_HEADERS = ["S.No", "Enquiry No", "Enquiry Date", "Customer Name", "Sub Type", "UOM", "Product Name", "Qty", "Following Person", "Delivery Date", "Status"];
 
 // ── Status filter — labelled Pending / Approved / Rejected for the
 // customer, but 'rejected' filters against the real backend value
@@ -87,6 +87,14 @@ const CLOTH_GROUPS = [
 ];
 
 const normalize = (v) => (v ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+
+// Same label-only override used across Product Selection / Cart / Order
+// Enquiry / staff Order List pages — "Meter" is stored/matched exactly
+// as before, only shown as "Mtr" here.
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
+}
 
 const groupFor = (subType) => {
   const c = normalize(subType);
@@ -121,16 +129,19 @@ export default function CustomerOrders() {
   // ── New filter state ──
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [uomFilter, setUomFilter] = useState("");
   const [activeType, setActiveType] = useState("all");
 
   const styles = {
     heading: { fontFamily: "'Space Grotesk', " + FONT, fontSize: 28, fontWeight: 700, margin: "0 0 4px", color: themeG.textMain, letterSpacing: "-0.4px" },
     headingSub: { fontSize: 13, color: themeG.textSub, margin: "0 0 22px" },
     tableBox: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)" },
-    tableScroll: { overflowX: "auto" },
+    // Shows roughly 10 data rows before scrolling; header stays pinned
+    // (position: sticky, already set on th below) while the body scrolls.
+    tableScroll: { overflowX: "auto", overflowY: "auto", maxHeight: 560 },
     table: { width: "100%", minWidth: 1000, borderCollapse: "collapse" },
-    th: { textAlign: "left", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" },
-    td: { padding: "12px 13px", fontSize: 13.5, color: themeG.textMain, borderBottom: "1px solid rgba(46,122,114,0.06)", fontFamily: FONT, whiteSpace: "nowrap" },
+    th: { textAlign: "center", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" },
+    td: { padding: "12px 13px", fontSize: 13.5, color: themeG.textMain, borderBottom: "1px solid rgba(46,122,114,0.06)", fontFamily: FONT, whiteSpace: "nowrap", textAlign: "center" },
 
     // ── Filter bar ──
     filterBar: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 16 },
@@ -194,6 +205,7 @@ export default function CustomerOrders() {
       const customerName = customer?.Name || user.name || "—";
       const subType = p.SubType || o.SubType || "—";
       const productName = p.Name || "—";
+      const uom = o.OrderDetails?.UOM || o.OrderDetails?.uom || p.UOM || "—";
 
       // Same 3-step chain as OrderList.jsx: eager-loaded relation ->
       // /users lookup by raw AssignedTo id -> this customer's own
@@ -216,6 +228,7 @@ export default function CustomerOrders() {
         date,
         customerName,
         subType,
+        uom,
         productName,
         qty: o.Quantity,
         followName,
@@ -236,11 +249,23 @@ export default function CustomerOrders() {
     return m;
   }, [rows]);
 
-  // ── Search + Status + Type filtering, applied together. ──
+  // UOM dropdown options — every distinct real UOM value on the loaded
+  // orders, plus the app's canonical Box/Pieces/Meter set so the
+  // dropdown always has something even before orders load. Labels go
+  // through uomLabel() so "Meter" shows as "Mtr"; filtering still
+  // matches the real stored value underneath.
+  const UOM_FILTER_FALLBACK = ["Box", "Pieces", "Meter"];
+  const uomOptions = useMemo(() => {
+    const fromData = rows.map((r) => r.uom).filter((u) => u && u !== "—");
+    return Array.from(new Set([...fromData, ...UOM_FILTER_FALLBACK])).sort();
+  }, [rows]);
+
+  // ── Search + Status + UOM + Type filtering, applied together. ──
   const filteredRows = useMemo(() => {
     let list = rows;
     if (activeType !== "all") list = list.filter((r) => r.group.id === activeType);
     if (statusFilter) list = list.filter((r) => normalize(r.status) === statusFilter);
+    if (uomFilter) list = list.filter((r) => r.uom === uomFilter);
     if (search.trim()) {
       const q = search.trim().toLowerCase();
       list = list.filter((r) =>
@@ -250,14 +275,12 @@ export default function CustomerOrders() {
         r.subType.toLowerCase().includes(q));
     }
     return list;
-  }, [rows, activeType, statusFilter, search]);
+  }, [rows, activeType, statusFilter, uomFilter, search]);
 
   return (
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <h1 style={styles.heading}>My Orders</h1>
-      <p style={styles.headingSub}>All the orders you've placed.</p>
 
       {error && (
         <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>
@@ -284,6 +307,16 @@ export default function CustomerOrders() {
         >
           {STATUS_FILTER_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+        <select
+          style={styles.statusSelect}
+          value={uomFilter}
+          onChange={(e) => setUomFilter(e.target.value)}
+        >
+          <option value="">All UOM</option>
+          {uomOptions.map((u) => (
+            <option key={u} value={u}>{uomLabel(u)}</option>
           ))}
         </select>
       </div>
@@ -339,6 +372,7 @@ export default function CustomerOrders() {
                   <td style={styles.td}>{r.date}</td>
                   <td style={styles.td}>{r.customerName}</td>
                   <td style={styles.td}>{r.subType}</td>
+                  <td style={styles.td}>{uomLabel(r.uom)}</td>
                   <td style={styles.td}>{r.productName}</td>
                   <td style={styles.td}>{r.qty}</td>
                   <td style={styles.td}>{r.followName}</td>

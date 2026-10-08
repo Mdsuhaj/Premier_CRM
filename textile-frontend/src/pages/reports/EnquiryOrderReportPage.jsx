@@ -10,7 +10,7 @@ import { getG, statusColor } from "../../theme";
 import API from "../../services/api";
 import { exportReportToExcel } from "../../utils/excelIO";
 import {
-  FONT, ListBox, ExportButton, PageHeading,
+  FONT, ListBox, ExportButton,
   errorBoxStyle, statCardStyle, groupBy, fmtDate, todayStamp,
 } from "./shared";
 
@@ -79,8 +79,7 @@ export default function EnquiryOrderReportPage() {
   };
 
   return (
-    <Layout pageTitle="Reports">
-      <PageHeading themeG={themeG} title="Enquiry Order Report" subtitle="Order Enquiry pipeline — pending, assigned, approved/declined — and conversion rate." />
+    <Layout pageTitle="Enquiry Order Report">
 
       {loading ? (
         <p style={{ color: themeG.textSub, fontFamily: FONT }}>Loading report…</p>

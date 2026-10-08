@@ -289,7 +289,7 @@ export default function CustomerShop() {
                   <span>₹{cartTotal.toLocaleString()}</span>
                 </div>
 
-                <button style={S.submitBtn} disabled={submitting} onClick={submitEnquiry}>
+                <button style={S.submitBtn} disabled={submitting} onClick={submitEnquiry} data-confirm="Submit this enquiry? It will be sent to the Admin for allocation." data-confirm-title="Submit Enquiry">
                   {submitting ? "Submitting…" : "Submit Enquiry"}
                 </button>
                 <p style={{ fontSize: 11, color: themeG.textSub, marginTop: 10, textAlign: "center" }}>

@@ -63,8 +63,6 @@ export default function EndUserEnquiry() {
     <EndUserLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <h1 style={S.heading}>Order Enquiry</h1>
-      <p style={S.headingSub}>Orders awaiting approval across your assigned area — view only.</p>
 
       {error && (
         <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>

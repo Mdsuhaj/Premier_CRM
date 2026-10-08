@@ -15,7 +15,7 @@ class Customer extends Model
     protected $fillable = [
         'Code', 'UserId', 'Name', 'Phone', 'Email', 'Type', 'District', 'Taluk',
         'Address', 'CreditLimit', 'MaxDiscountPct', 'Outstanding', 'Status', 'Notes',
-        'CreatedBy', 'ApprovedBy',
+        'CreatedBy', 'ApprovedBy', 'OracleId',
         // Mobile-app "Add Customer" parity fields (see 2026_07_16 migration)
         'BusinessType', 'Emails', 'Phones', 'Addresses', 'ContactPersons',
         'GSTNo', 'PANNo', 'TANNo',

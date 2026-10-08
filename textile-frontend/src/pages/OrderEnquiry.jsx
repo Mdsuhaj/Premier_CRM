@@ -3,54 +3,28 @@
 // The actual "cart" page — everything added via Product Selection's
 // "Add to Cart" lands here for review before it becomes a real enquiry.
 // This is also where Additional Details (Requested Date, Ref/PO,
-// Remarks) live and where Submit Enquiry actually happens — Product
-// Selection itself never submits anything anymore, it only adds to this
-// cart.
+// Remarks) live and where Submit Enquiry actually happens.
 //
 // ── Drafts ──
-// Resuming a saved draft now happens on Product Selection
-// (ProductCatalog.jsx), not here — that's where you'd actually want to
-// keep shopping. Product Selection merges the draft's items straight
-// into the shared cart (utils/customerCart.js) and stashes the draft's
-// Additional Details via utils/draftSession.js. This page picks that
-// handoff up once on mount (if present) to restore Requested Date /
-// Ref-PO / Remarks and to know which draft is being edited, then clears
-// it — a one-time pickup, not something that persists across visits.
+// Resuming a saved draft happens on Product Selection (ProductCatalog.jsx).
+// It merges the draft's items into the shared cart (utils/customerCart.js)
+// and stashes the draft's Additional Details via utils/draftSession.js.
+// This page picks that handoff up once on mount, then clears it.
 //
-// "💾 Save Draft" here saves the current cart + details as a draft, then
-// — same as Submit does — clears the cart and this page's fields, and
-// moves on to the Drafts list, instead of leaving a stale cart sitting
-// here after it's already been saved off as a draft.
+// "💾 Save Draft" saves the current cart + details as a draft, clears the
+// cart and this page's fields, and moves on to the Drafts list.
 //
-// ── "Edit" now covers the whole row, not just Qty ──
-// Clicking Edit on a line switches it into an editable state for every
-// order-specific field on that row: Qty (stepper, as before) AND Colour
-// (a colour-picker swatch instead of a static dot). Sort No / Shade No /
-// Type / Product Name stay read-only — those identify *which* catalog
-// item this line is, and changing them isn't "editing an order", it's
-// swapping products (do that by removing the row and adding the right
-// one from the catalog instead). Colour picks are kept in local
-// component state (colorOverrides) since the shared cart store doesn't
-// have a field-level update API beyond qty yet — see
-// utils/customerCart.js if that needs to become persisted too.
+// ── "Edit" covers the whole row, not just Qty ──
+// Clicking Edit switches the row's Qty stepper on. Sort No / Shade No /
+// Product Name stay read-only (swap products by removing the row and
+// adding the right one from the catalog).
 //
 // ── Qty and UOM are two separate columns ──
-// Qty (the stepper/number) and UOM (m / pcs, derived from the product's
-// SubType via dummyUom()) are their own dedicated columns, never
-// combined into a single "4 m"-style cell — keeps Qty independently
-// editable/sortable/exportable without string-parsing a unit back out
-// of it, and matches every other product table in the app (catalog,
-// admin product list, end-user cart).
+// Never combined into a single "4 m"-style cell.
 //
-// Layout note: Save Draft / Submit Enquiry now live in a bottom action
-// row AFTER the Additional Details card, not in the cart's own footer.
-// They used to sit directly under the product rows, above Requested
-// Date / Ref-PO / Remarks — which meant Submit Enquiry was the very next
-// clickable thing right after entering a product's qty, so people hit it
-// before ever reaching the fields below. Requested Date is now also
-// required before submit, matching the End User cart page
-// (end-user/CartCheckout.jsx), instead of silently submitting with a
-// null delivery date.
+// Layout note: Save Draft / Submit Enquiry live in a bottom action row
+// AFTER the Additional Details card. Requested Date is required before
+// submit, and CANNOT be in the past (today or later only).
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CustomerLayout from "../components/CustomerLayout";
@@ -60,13 +34,16 @@ import API from "../services/api";
 import { getCart, updateCartQty, removeFromCart, clearCart, subscribeToCart } from "../utils/customerCart";
 import { saveDraft as saveDraftEntry, deleteDraft as deleteDraftEntry } from "../utils/customerDrafts";
 import { getDraftSession, clearDraftSession } from "../utils/draftSession";
+import { BRAND } from "../brand";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-// ── Same dummy Type / Shade No / UOM logic as ProductCatalog.jsx, so a
-// cart row shows the same Type/Shade No it showed on the catalog table
-// it was added from. Kept in sync manually since these are two separate
-// pages — see ProductCatalog.jsx if this list ever changes there.
+// Local (not UTC) yyyy-mm-dd, so "today" is right for IST users too.
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 const DUMMY_TYPES = ["BLD & DYED", "Bld/Dyed", "R.Blue/G.Blue", "Fiber Dyed", "YD Dyed", "YD Slub", "3.7 & 7.4", "8*137 (Box)", "Spl Maroon"];
 const DUMMY_SHADE_NOS = ["101", "102", "103", "104", "105", "106"];
 const DUMMY_SWATCHES = ["#8FD9A8", "#7FD1E0", "#E893C9", "#9A9AA5", "#F0A15C", "#B7A6E0"];
@@ -76,13 +53,17 @@ function dummyType(product, i) {
 }
 function dummyShadeNo(product, i) {
   const num = product.ShadeNo || DUMMY_SHADE_NOS[i % DUMMY_SHADE_NOS.length];
-  return `Shade ${num}`;
+  return ` ${num}`;
 }
-function dummyUom(subType) {
-  const u = (subType || "").toLowerCase();
-  if (u.includes("shirting") || u.includes("suiting") || u.includes("blouse")) return "m";
-  return "pcs";
+
+// Label-only override — the cart line still stores/sends the real value.
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
 }
+
+// Dhoti-family SubTypes use "Border No" instead of "Shade No".
+const DHOTI_SUBTYPES = new Set(["Dhoti", "dhoti", "Cotton Dhoti Grey", "cotton dhoti grey", "BO Grey - Dhothies", "Cotton Dhoti Fabric", "cotton dhoti fabric", "BO Fabric - Dhothies"]);
 
 export default function OrderEnquiry() {
   const { isDark } = useTheme();
@@ -101,13 +82,10 @@ export default function OrderEnquiry() {
   const [refNo, setRefNo] = useState("");
   const [remarks, setRemarks] = useState("");
 
-  // Which cart row (by key) is currently in edit mode — while editing,
-  // both Qty and Colour become interactive for that row; every other
-  // row stays read-only until its own "Edit" is clicked.
+  // Which cart row (by key) is currently in edit mode.
   const [editingKey, setEditingKey] = useState(null);
 
-  // Per-row colour overrides picked while editing, keyed by cart item
-  // key — local-only for now (see file header note above).
+  // Per-row colour overrides (local-only, see file header).
   const [colorOverrides, setColorOverrides] = useState({});
 
   useEffect(() => {
@@ -118,23 +96,19 @@ export default function OrderEnquiry() {
   }, []);
 
   useEffect(() => {
-    // One-time pickup of Additional Details handed off by Product
-    // Selection when a draft was resumed there (see utils/draftSession.js).
-    // The draft's items are already in the shared cart by the time this
-    // page mounts — only the details + which-draft-is-this need restoring
-    // here. Cleared immediately after reading so it never reapplies on a
-    // later, unrelated visit.
+    // One-time pickup of Additional Details handed off by Product Selection
+    // when a draft was resumed there (see utils/draftSession.js).
     const session = getDraftSession();
     if (!session) return;
     setDraftId(session.draftId || null);
-    if (session.requestedDate) setRequestedDate(session.requestedDate);
+    // A resumed draft may carry a date that has since passed — drop it so
+    // the customer has to pick a valid one.
+    if (session.requestedDate && session.requestedDate >= todayStr()) setRequestedDate(session.requestedDate);
     if (session.refNo) setRefNo(session.refNo);
     if (session.remarks) setRemarks(session.remarks);
     clearDraftSession();
     // eslint-disable-next-line
   }, []);
-
-  const cartTotal = cart.reduce((sum, i) => sum + i.qty * parseFloat(i.product.Price || 0), 0);
 
   const buildNotes = () => {
     const parts = [];
@@ -146,16 +120,32 @@ export default function OrderEnquiry() {
   const submitEnquiry = async () => {
     if (cart.length === 0) return;
     if (!requestedDate) { setError("Please pick a Requested Date before submitting."); return; }
+    // `min` on the input only greys out the picker; typing a date by hand
+    // can still bypass it, so check here too.
+    if (requestedDate < todayStr()) { setError("Requested Date cannot be in the past."); return; }
     setSubmitting(true);
     setError("");
     setNotice("");
     try {
       const res = await API.post("/orders/bulk", {
         items: cart.map((i) => ({
-          productId: i.product.Id,
+          ...(i.product.RowKey
+            ? {
+                oracleProduct: {
+                  id: i.product.Id,
+                  rowKey: i.product.RowKey,
+                  sortNo: i.product.SortNo,
+                  shadeNo: i.product.ShadeNo,
+                  name: i.product.Name,
+                },
+              }
+            : { productId: i.product.Id }), // old cart lines only
           qty: i.qty,
           color: colorOverrides[i.key] || i.color,
           size: i.size,
+          piecesOfLength: i.piecesOfLength || undefined,
+          uom: i.uom || undefined,
+          remarks: i.remarks || undefined,
         })),
         deliveryDate: requestedDate || null,
         notes: buildNotes(),
@@ -174,10 +164,6 @@ export default function OrderEnquiry() {
     }
   };
 
-  // Saving a draft "closes out" this cart the same way Submit does — the
-  // draft now owns these items, so this page goes back to its empty
-  // state and the customer lands on Drafts, matching what happens when
-  // saving a draft from Product Selection.
   const saveDraft = () => {
     if (cart.length === 0) { setError("Add something to the cart before saving a draft."); return; }
     setSavingDraft(true);
@@ -190,7 +176,7 @@ export default function OrderEnquiry() {
         items: cart.map((i) => ({
           productId: i.product.Id, code: i.product.Code, name: i.product.Name,
           subType: i.product.SubType, qty: i.qty, product: i.product,
-          color: colorOverrides[i.key] || i.color,
+          color: colorOverrides[i.key] || i.color, uom: i.uom,
         })),
       });
       clearCart();
@@ -216,20 +202,17 @@ export default function OrderEnquiry() {
 
     tableScroll: { overflowX: "auto" },
     table: { width: "100%", minWidth: 800, borderCollapse: "collapse" },
-    th: { textAlign: "left", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}` },
-    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` },
-    qtyBox: { display: "flex", alignItems: "center", gap: 8 },
+    th: { textAlign: "center", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}` },
+    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center" },
+    qtyBox: { display: "flex", alignItems: "center", justifyContent: "center", gap: 8 },
     qtyBtn: { width: 26, height: 26, borderRadius: 7, border: `1px solid ${themeG.border}`, background: themeG.bg, color: themeG.textMain, fontSize: 14, fontWeight: 700, cursor: "pointer" },
     qtyVal: { fontSize: 13.5, fontWeight: 600, color: themeG.textMain, minWidth: 22, textAlign: "center" },
     swatch: (c) => ({ width: 20, height: 20, borderRadius: "50%", background: c, border: "1.5px solid rgba(0,0,0,0.14)", display: "inline-block" }),
     colorPicker: { width: 28, height: 28, padding: 0, border: `1.5px solid ${themeG.border}`, borderRadius: "50%", cursor: "pointer", background: "none" },
-    actionBtns: { display: "flex", gap: 6, flexWrap: "wrap" },
+    actionBtns: { display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" },
     editBtn: { padding: "5px 12px", borderRadius: 7, border: `1px solid ${themeG.accent}`, background: "rgba(91,155,217,0.08)", color: themeG.accent, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
     removeBtn: { padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(150,48,47,0.3)", background: "rgba(150,48,47,0.06)", color: "#96302F", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
 
-    // Cart footer now only shows the running total — no action buttons
-    // here anymore, so there's nothing to click before reaching
-    // Additional Details below.
     footer: { display: "flex", alignItems: "center", justifyContent: "flex-end", padding: "18px 22px", background: themeG.bg },
     totalLabel: { fontSize: 13, color: themeG.textSub, textAlign: "right" },
     totalValue: { fontSize: 20, fontWeight: 700, color: "#1E9E5A", textAlign: "right" },
@@ -242,19 +225,15 @@ export default function OrderEnquiry() {
     textarea: { width: "100%", boxSizing: "border-box", padding: "9px 13px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13.5, fontFamily: FONT, color: themeG.textMain, background: themeG.bg, outline: "none", resize: "vertical", minHeight: 40 },
     charCount: { fontSize: 10.5, color: themeG.textSub, textAlign: "right", marginTop: 3 },
 
-    // ── Bottom action row — Save Draft / Submit Enquiry now live here,
-    // after Additional Details, matching end-user/CartCheckout.jsx. ──
     bottomRow: { display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 20, flexWrap: "wrap" },
     draftBtn: { padding: "12px 20px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
-    submitBtn: { padding: "12px 28px", borderRadius: 9, border: "none", background: themeG.accent, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
+    submitBtn: { padding: "12px 28px", borderRadius: 9, border: "none", background: BRAND.green, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
   };
 
   return (
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <h1 style={S.heading}>🛒 Order Enquiry</h1>
-      <p style={S.headingSub}>Review the products you've added before submitting.</p>
 
       {error && <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>{error}</div>}
       {notice && <div style={{ marginBottom: 20, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent }}>{notice}</div>}
@@ -273,26 +252,31 @@ export default function OrderEnquiry() {
                   <tr>
                     <th style={S.th}>S.No</th>
                     <th style={S.th}>Sort No</th>
-                    <th style={S.th}>Shade No</th>
+                    <th style={S.th}>{
+                      cart.length > 0 && cart.every((i) => DHOTI_SUBTYPES.has(i.product.SubType)) ? "Border No" : "Shade"
+                    }</th>
                     <th style={S.th}>Product Name</th>
-                    <th style={S.th}>Type</th>
-                    <th style={S.th}>Qty</th>
+                    {/* HIDDEN: Type */}
+                    {/* <th style={S.th}>Type</th> */}
+                    {/* REMOVED: Pieces of Length */}
                     <th style={S.th}>UOM</th>
-                    <th style={S.th}>Colour</th>
+                    {/* HIDDEN: Colour */}
+                    {/* <th style={S.th}>Colour</th> */}
+                    <th style={S.th}>Quantity</th>
+                    <th style={S.th}>Remarks</th>
                     <th style={S.th}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {cart.map((item, i) => {
                     const isEditing = editingKey === item.key;
-                    const swatch = colorOverrides[item.key] || item.product.Color || DUMMY_SWATCHES[i % DUMMY_SWATCHES.length];
                     return (
                       <tr key={item.key}>
                         <td style={S.td}>{i + 1}</td>
-                        <td style={S.td}>{item.product.Code || "—"}</td>
+                        <td style={S.td}>{item.product.SortNo || item.product.Code || "—"}</td>
                         <td style={S.td}>{dummyShadeNo(item.product, i)}</td>
                         <td style={S.td}>{item.product.Name}</td>
-                        <td style={S.td}>{dummyType(item.product, i)}</td>
+                        <td style={S.td}>{uomLabel(item.uom || "Box")}</td>
                         <td style={S.td}>
                           {isEditing ? (
                             <div style={S.qtyBox}>
@@ -304,8 +288,7 @@ export default function OrderEnquiry() {
                             <span>{item.qty}</span>
                           )}
                         </td>
-                        <td style={S.td}>{dummyUom(item.product.SubType)}</td>
-                        <td style={S.td}><div style={S.swatch(swatch)} /></td>
+                        <td style={S.td}>{item.remarks || "—"}</td>
                         <td style={S.td}>
                           <div style={S.actionBtns}>
                             <button style={S.editBtn} onClick={() => setEditingKey(isEditing ? null : item.key)}>
@@ -337,15 +320,16 @@ export default function OrderEnquiry() {
             <p style={S.detailsTitle}>Additional Details</p>
             <div style={S.detailsGrid}>
               <div>
-                <label style={S.label}>Requested Date *</label>
-                <input type="date" style={S.input} value={requestedDate} onChange={(e) => setRequestedDate(e.target.value)} />
+                <label style={S.label}>Requested Date <span style={{ color: BRAND.red }}>*</span></label>
+                {/* min = today → past days are disabled in the picker */}
+                <input type="date" style={S.input} min={todayStr()} value={requestedDate} onChange={(e) => setRequestedDate(e.target.value)} />
               </div>
               <div>
                 <label style={S.label}>Reference / PO No.</label>
                 <input style={S.input} placeholder="Enter Reference / PO No." value={refNo} onChange={(e) => setRefNo(e.target.value)} />
               </div>
               <div>
-                <label style={S.label}>Remarks</label>
+                <label style={S.label}>Dispatch Instruction</label>
                 <textarea style={S.textarea} placeholder="Enter any additional remarks (if any)" maxLength={500} rows={2}
                   value={remarks} onChange={(e) => setRemarks(e.target.value)} />
                 <p style={S.charCount}>{remarks.length} / 500</p>
@@ -353,11 +337,9 @@ export default function OrderEnquiry() {
             </div>
           </div>
 
-          {/* ── Save Draft / Submit Enquiry — now after Additional
-              Details, not before it. ── */}
           <div style={S.bottomRow}>
             <button style={S.draftBtn} disabled={savingDraft} onClick={saveDraft}>💾 Save Draft</button>
-            <button style={S.submitBtn} disabled={submitting} onClick={submitEnquiry}>
+            <button style={S.submitBtn} disabled={submitting} onClick={submitEnquiry} data-confirm="Submit this enquiry? It will be sent to the Admin for allocation." data-confirm-title="Submit Enquiry">
               {submitting ? "Submitting…" : "📨 Submit Enquiry"}
             </button>
           </div>

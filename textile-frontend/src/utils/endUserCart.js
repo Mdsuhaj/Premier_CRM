@@ -40,19 +40,36 @@ export function getCart(customerId) {
   return all[String(customerId)] || [];
 }
 
-export function addToCart(customerId, { product, qty }) {
+// piecesOfLength: free-text value from the "Pieces of Length" column on
+// Product Selection — carried on the cart line alongside qty so it
+// survives through to Cart Checkout / order submission. Re-adding the
+// same product updates it to whatever was just entered (same as qty
+// accumulates), rather than being locked to whatever was typed first.
+//
+// uom: the UOM (Box / Pieces / Meter) picked on Product Selection's UOM
+// dropdown at the moment this row was added — FIX: same bug as
+// customerCart.js had. Product Selection was already calling
+// addToCart(customerId, { product, qty, uom: uomFilter }), but this
+// function never destructured a `uom` param at all, so it was silently
+// dropped every time. That meant Cart Checkout's UOM column could never
+// show the officer's real choice — see CartCheckout.jsx, which used to
+// paper over the gap with a hardcoded dummyUom() always returning "Box".
+// Now stored on the line, same as piecesOfLength.
+export function addToCart(customerId, { product, qty, piecesOfLength, uom, remarks }) {
   if (!customerId || !product || !qty || qty <= 0) return;
   const all = readAll();
   const cid = String(customerId);
   const list = all[cid] || [];
-  const key = String(product.Id);
+  const key = String(product.RowKey ?? product.Id);
   const existing = list.find((l) => l.key === key);
   let next;
   if (existing) {
     const cap = product.Quantity ?? existing.qty + qty;
-    next = list.map((l) => (l.key === key ? { ...l, qty: Math.min(l.qty + qty, cap) } : l));
+    next = list.map((l) => (l.key === key
+      ? { ...l, qty: Math.min(l.qty + qty, cap), piecesOfLength: piecesOfLength ?? l.piecesOfLength ?? "", uom: uom || l.uom || "Box", remarks: remarks ?? l.remarks ?? "" }
+      : l));
   } else {
-    next = [...list, { key, product, qty: Math.min(qty, product.Quantity ?? qty) }];
+    next = [...list, { key, product, qty: Math.min(qty, product.Quantity ?? qty), piecesOfLength: piecesOfLength ?? "", uom: uom || "Box", remarks: remarks || "" }];
   }
   all[cid] = next;
   writeAll(all);

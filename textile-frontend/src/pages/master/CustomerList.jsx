@@ -16,15 +16,15 @@ import ExcelToolbar from "../../components/ExcelToolbar";
 // Columns shown in the Customer List table — the Excel download/upload
 // columns are always kept identical to this list.
 const CUSTOMER_EXCEL_COLUMNS = [
-  { key: "id",       header: "ID" },
-  { key: "name",     header: "Customer Name" },
-  { key: "phone",    header: "Phone" },
+  { key: "id", header: "ID" },
+  { key: "name", header: "Customer Name" },
+  { key: "phone", header: "Phone" },
   { key: "district", header: "District" },
-  { key: "taluk",    header: "Taluk" },
-  { key: "type",     header: "Type" },
-  { key: "orders",   header: "Orders" },
-  { key: "balance",  header: "Balance (₹)" },
-  { key: "status",   header: "Status" },
+  { key: "taluk", header: "Taluk" },
+  { key: "type", header: "Type" },
+  { key: "orders", header: "Orders" },
+  { key: "balance", header: "Balance (₹)" },
+  { key: "status", header: "Status" },
 ];
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
@@ -33,7 +33,7 @@ const getThemeColors = () => getG(localStorage.getItem("premier_theme") === "dar
 /* Row color by customer type */
 const typeColors = {
   wholesale: { bg: "rgba(216,230,243,0.22)", dot: "#5B9BD9", border: "rgba(91,155,217,0.20)" },
-  retail:    { bg: "rgba(200,240,200,0.22)", dot: "#1F5C99", border: "rgba(46,122,114,0.18)" },
+  retail: { bg: "rgba(200,240,200,0.22)", dot: "#1F5C99", border: "rgba(46,122,114,0.18)" },
 };
 
 const Badge = ({ text }) => {
@@ -228,60 +228,55 @@ function CustomerListTab({ themeG, navigate }) {
 
       <div style={{ background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, boxShadow: "0 4px 16px rgba(46,122,114,0.06)" }}>
         <div style={{ overflowX: "auto", borderRadius: "14px 14px 0 0" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ borderBottom: `1px solid ${themeG.border}` }}>
-              {["ID", "Customer Name", "Phone", "District", "Taluk", "Type", "Orders", "Balance (₹)", "Status", "Actions"].map((h) => (
-                <th key={h} style={{ textAlign: "left", fontSize: 11,  padding: "10px 12px", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,  whiteSpace: "nowrap" ,color: "#FFFFFF", background: "#1F3A63"}}>
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.length === 0 ? (
-              <tr><td colSpan={10} style={{ textAlign: "center", padding: 40, color: themeG.textSub, fontSize: 14 }}>No customers found.</td></tr>
-            ) : filtered.map((c) => {
-              const rc = typeColors[c.type] || typeColors.retail;
-              return (
-                <tr key={c.id} style={{ borderBottom: "1px solid rgba(46,122,114,0.06)", background: rc.bg }}>
-                  <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.accent, fontWeight: 600, borderLeft: `3px solid ${rc.dot}`, whiteSpace: "nowrap" }}>{c.id}</td>
-                  <td style={{ padding: "12px 12px", fontSize: 14, color: themeG.textMain, fontWeight: 500 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, maxWidth: 220 }}>
-                      <div style={{ width: 28, height: 28, borderRadius: "50%", background: `${rc.dot}22`, border: `1.5px solid ${rc.dot}44`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: rc.dot, flexShrink: 0 }}>
-                        {c.name[0]}
-                      </div>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${themeG.border}` }}>
+                {["ID", "Customer Name", "Phone", "District", "Taluk", "Type", "Orders", "Balance (₹)", "Status", "Actions"].map((h) => (
+                  <th key={h} style={{ textAlign: "center", fontSize: 11, padding: "10px 12px", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, whiteSpace: "nowrap", color: "#FFFFFF", background: "#1F3A63" }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr><td colSpan={10} style={{ textAlign: "center", padding: 40, color: themeG.textSub, fontSize: 14 }}>No customers found.</td></tr>
+              ) : filtered.map((c) => {
+                const rc = typeColors[c.type] || typeColors.retail;
+                return (
+                  <tr key={c.id} style={{ borderBottom: "1px solid rgba(46,122,114,0.06)", background: "#FFFFFF" }}>
+                    <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.accent, fontWeight: 600, borderLeft: `3px solid ${rc.dot}`, whiteSpace: "nowrap", textAlign: "center" }}>{c.id}</td>
+                    <td style={{ padding: "12px 12px", fontSize: 14, color: themeG.textMain, fontWeight: 500, textAlign: "center" }}>
                       <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={c.name}>{c.name}</span>
-                    </div>
-                  </td>
-                  <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textSub, whiteSpace: "nowrap" }}>{c.phone}</td>
-                  <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textMain, whiteSpace: "nowrap" }}>{c.district}</td>
-                  <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textSub, whiteSpace: "nowrap" }}>{c.taluk}</td>
-                  <td style={{ padding: "12px 12px", whiteSpace: "nowrap" }}><TypeBadge type={c.type} /></td>
-                  <td style={{ padding: "12px 12px", fontSize: 13, fontWeight: 600, color: themeG.textMain, whiteSpace: "nowrap" }}>{c.orders}</td>
-                  <td style={{ padding: "12px 12px", fontSize: 13, fontWeight: 700, color: c.balance > 0 ? "#B23A3A" : themeG.textSub, whiteSpace: "nowrap" }}>
-                    {c.balance > 0 ? `₹${c.balance.toLocaleString()}` : "—"}
-                  </td>
-                  <td style={{ padding: "12px 12px", whiteSpace: "nowrap" }}><Badge text={c.status} /></td>
-                  <td style={{ padding: "12px 12px" }}>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      <button style={btnStyle("#5B9BD9")} onClick={() => navigate(`/master/customers/${c.dbId}`)} title="View">👁️</button>
-                      <button style={btnStyle(themeG.accent)} onClick={() => navigate(`/master/customers/${c.dbId}?edit=1`)} title="Edit">✏️</button>
-                      <button
-                        style={btnStyle("#B23A3A")}
-                        disabled={deletingId === c.dbId}
-                        onClick={() => handleDelete(c)}
-                        title="Delete customer"
-                      >
-                        {deletingId === c.dbId ? "…" : "🗑️"}
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                    </td>
+                    <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textSub, whiteSpace: "nowrap", textAlign: "center" }}>{c.phone}</td>
+                    <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textMain, whiteSpace: "nowrap", textAlign: "center" }}>{c.district}</td>
+                    <td style={{ padding: "12px 12px", fontSize: 13, color: themeG.textSub, whiteSpace: "nowrap", textAlign: "center" }}>{c.taluk}</td>
+                    <td style={{ padding: "12px 12px", whiteSpace: "nowrap", textAlign: "center" }}><TypeBadge type={c.type} /></td>
+                    <td style={{ padding: "12px 12px", fontSize: 13, fontWeight: 600, color: themeG.textMain, whiteSpace: "nowrap", textAlign: "center" }}>{c.orders}</td>
+                    <td style={{ padding: "12px 12px", fontSize: 13, fontWeight: 700, color: c.balance > 0 ? "#B23A3A" : themeG.textSub, whiteSpace: "nowrap", textAlign: "center" }}>
+                      {c.balance > 0 ? `₹${c.balance.toLocaleString()}` : "—"}
+                    </td>
+                    <td style={{ padding: "12px 12px", whiteSpace: "nowrap", textAlign: "center" }}><Badge text={c.status} /></td>
+                    <td style={{ padding: "12px 12px", textAlign: "center" }}>
+                      <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
+                        <button style={btnStyle("#5B9BD9")} onClick={() => navigate(`/master/customers/${c.dbId}`)} title="View">👁️</button>
+                        <button style={btnStyle(themeG.accent)} onClick={() => navigate(`/master/customers/${c.dbId}?edit=1`)} title="Edit">✏️</button>
+                        <button
+                          style={btnStyle("#B23A3A")}
+                          disabled={deletingId === c.dbId}
+                          onClick={() => handleDelete(c)}
+                          title="Delete customer"
+                        >
+                          {deletingId === c.dbId ? "…" : "🗑️"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
         <div style={{ padding: "10px 13px", borderTop: `1px solid ${themeG.border}`, fontSize: 12, color: themeG.textSub }}>
           Showing {filtered.length} of {customers.length} customers
@@ -445,7 +440,7 @@ function CustomerStatusTab({ themeG, navigate }) {
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [filter]);
 
-  const th = { textAlign: "left", fontSize: 11,  color: "#FFFFFF", background: "#1F3A63",padding: "12px 16px", borderBottom: "1px solid rgba(46,122,114,0.13)", textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 };
+  const th = { textAlign: "left", fontSize: 11, color: "#FFFFFF", background: "#1F3A63", padding: "12px 16px", borderBottom: "1px solid rgba(46,122,114,0.13)", textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 };
   const td = { padding: "13px 16px", fontSize: 13.5, color: themeG.textMain };
 
   const actionBtn = (bg, color, border) => ({

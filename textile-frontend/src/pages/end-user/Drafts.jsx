@@ -111,12 +111,6 @@ export default function Drafts() {
     <EndUserLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <div style={S.header}>
-        <div>
-          <h1 style={S.title}>My Drafts</h1>
-          <p style={S.subtitle}>Enquiries you've saved but haven't submitted yet.</p>
-        </div>
-      </div>
 
       {notice && (
         <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent }}>

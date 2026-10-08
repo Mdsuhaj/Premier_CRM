@@ -22,30 +22,63 @@ class DashboardController extends Controller
 
         // Base scopes
         $customerQ = Customer::query();
-        $orderQ    = Order::with(['customer', 'product']);
-        $productQ  = Product::query();
+        $orderQ = Order::with(['customer', 'product']);
+        $productQ = Product::query();
 
         // Scope by role — District/Taluk are multi-value (JSON array) on
-        // the caller's Employee record, so we match against that, not a
-        // plain scalar on User. Mirrors OrderController/CustomerController.
+        // the caller's Employee record. If the end_user has no assigned
+        // Taluk(s), fall back to their District, and if that's also empty,
+        // show ALL orders in their area (unscoped). An empty area list must
+        // NOT be passed to whereIn() — that would match zero rows and show
+        // 0 on every dashboard card, which is the bug being fixed here.
         if ($user->role === 'end_user') {
             $taluks = $this->callerAreas($user, 'Taluk');
-            $customerQ->whereIn('Taluk', $taluks);
-            $orderQ->whereHas('customer', fn ($q) => $q->whereIn('Taluk', $taluks));
+            if (!empty($taluks)) {
+                $customerQ->whereIn('Taluk', $taluks);
+                $customerIds = Customer::whereIn('Taluk', $taluks)->pluck('Id');
+                $orderQ->where(function ($q) use ($user, $customerIds) {
+                    $q->where('CreatedBy', $user->id)
+                        ->orWhereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+                });
+            } else {
+                // No taluk assigned — try district fallback
+                $districts = $this->callerAreas($user, 'District');
+                if (!empty($districts)) {
+                    $customerQ->whereIn('District', $districts);
+                    $customerIds = Customer::whereIn('District', $districts)->pluck('Id');
+                    $orderQ->where(function ($q) use ($user, $customerIds) {
+                        $q->where('CreatedBy', $user->id)
+                            ->orWhereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+                    });
+                } else {
+                    // No area assigned at all — still show orders this
+                    // end_user personally placed, rather than nothing.
+                    $orderQ->where('CreatedBy', $user->id);
+                }
+            }
         } elseif ($user->role === 'admin') {
             $districts = $this->callerAreas($user, 'District');
-            $customerQ->whereIn('District', $districts);
-            $orderQ->whereHas('customer', fn ($q) => $q->whereIn('District', $districts));
+            if (!empty($districts)) {
+                $customerQ->whereIn('District', $districts);
+                $orderQ->whereHas('customer', fn($q) => $q->whereIn('District', $districts));
+            }
         }
 
+        if ($user->role === 'system_admin') {
+            $orderQ->whereExists(function ($q) {
+                $q->from('sale_order_line')
+                    ->whereColumn('sale_order_line.CrmOrderId', 'Orders.Id')
+                    ->where('sale_order_line.USERPRIMARYQUANTITY', '>', 0);
+            });
+        }
         $totalCustomers = (clone $customerQ)->where('Status', 'approved')->count();
-        $activeOrders   = (clone $orderQ)->whereIn('Status', ['pending', 'processing', 'approved'])->count();
-        $totalProducts  = $productQ->where('Status', 'active')->count();
-        $totalRevenue   = (clone $orderQ)->where('PaymentStatus', 'paid')->sum('TotalAmount');
+        $activeOrders = (clone $orderQ)->whereIn('Status', ['pending', 'processing', 'approved'])->count();
+        $totalProducts = $productQ->where('Status', 'active')->count();
+        $totalRevenue = (clone $orderQ)->where('PaymentStatus', 'paid')->sum('TotalAmount');
 
-        $totalOrders    = (clone $orderQ)->count();
+        $totalOrders = (clone $orderQ)->count();
         $approvedOrders = (clone $orderQ)->whereIn('Status', ['approved', 'processing', 'dispatched', 'delivered'])->count();
-        $pendingOrders  = (clone $orderQ)->where('Status', 'pending')->count();
+        $pendingOrders = (clone $orderQ)->where('Status', 'pending')->count();
         $rejectedOrders = (clone $orderQ)->where('Status', 'declined')->count();
 
         $recentOrders = (clone $orderQ)
@@ -53,25 +86,27 @@ class DashboardController extends Controller
             ->limit(10)
             ->get()
             ->map(fn($o) => [
-                'id'            => $o->Code,
-                'customer'      => $o->customer->Name ?? '—',
-                'product'       => $o->product->Name ?? '—',
-                'amount'        => $o->TotalAmount,
-                'status'        => $o->Status,
-                'payment'       => $o->PaymentStatus,
+                'id' => $o->Code,
+                'date' => $o->CreatedAt,
+                'customer' => $o->customer->Name ?? '—',
+                'product' => $o->product->Name ?? '—',
+                'amount' => $o->TotalAmount,
+                'quantity' => $o->Quantity,
+                'status' => $o->Status,
+                'payment' => $o->PaymentStatus,
                 'delivery_date' => $o->DeliveryDate,
             ]);
 
         return response()->json([
             'stats' => [
-                'total_customers'  => $totalCustomers,
-                'active_orders'    => $activeOrders,
-                'total_products'   => $totalProducts,
-                'total_revenue'    => $totalRevenue,
-                'total_orders'     => $totalOrders,
-                'approved_orders'  => $approvedOrders,
-                'pending_orders'   => $pendingOrders,
-                'rejected_orders'  => $rejectedOrders,
+                'total_customers' => $totalCustomers,
+                'active_orders' => $activeOrders,
+                'total_products' => $totalProducts,
+                'total_revenue' => $totalRevenue,
+                'total_orders' => $totalOrders,
+                'approved_orders' => $approvedOrders,
+                'pending_orders' => $pendingOrders,
+                'rejected_orders' => $rejectedOrders,
             ],
             'recent_orders' => $recentOrders,
         ]);
@@ -112,14 +147,40 @@ class DashboardController extends Controller
 
         if ($caller->role === 'end_user') {
             $taluks = $this->callerAreas($caller, 'Taluk');
-            $customerIds = Customer::whereIn('Taluk', $taluks)->pluck('Id');
-            $query->whereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+            if (!empty($taluks)) {
+                $customerIds = Customer::whereIn('Taluk', $taluks)->pluck('Id');
+                $query->where(function ($q) use ($caller, $customerIds) {
+                    $q->where('CreatedBy', $caller->id)
+                        ->orWhereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+                });
+            } else {
+                $districts = $this->callerAreas($caller, 'District');
+                if (!empty($districts)) {
+                    $customerIds = Customer::whereIn('District', $districts)->pluck('Id');
+                    $query->where(function ($q) use ($caller, $customerIds) {
+                        $q->where('CreatedBy', $caller->id)
+                            ->orWhereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+                    });
+                } else {
+                    $query->where('CreatedBy', $caller->id);
+                }
+            }
         }
 
         if ($caller->role === 'admin') {
             $districts = $this->callerAreas($caller, 'District');
-            $customerIds = Customer::whereIn('District', $districts)->pluck('Id');
-            $query->whereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+            if (!empty($districts)) {
+                $customerIds = Customer::whereIn('District', $districts)->pluck('Id');
+                $query->whereIn('CustomerId', $customerIds->isEmpty() ? [0] : $customerIds);
+            }
+        }
+
+        if ($caller->role === 'system_admin') {
+            $query->whereExists(function ($q) {
+                $q->from('sale_order_line')
+                    ->whereColumn('sale_order_line.CrmOrderId', 'Orders.Id')
+                    ->where('sale_order_line.USERPRIMARYQUANTITY', '>', 0);
+            });
         }
 
         $orders = $query->get();
@@ -127,21 +188,21 @@ class DashboardController extends Controller
 
         // ── 1. Enquiry Status ──────────────────────────────────────────
         $enquiryStatus = [
-            'total'    => $orders->count(),
-            'pending'  => $orders->where('Status', 'pending')->count(),
+            'total' => $orders->count(),
+            'pending' => $orders->where('Status', 'pending')->count(),
             'approved' => $orders->whereIn('Status', ['approved', 'processing', 'dispatched', 'delivered'])->count(),
             'rejected' => $orders->where('Status', 'declined')->count(),
         ];
 
         // ── 2. Total Orders Placed ─────────────────────────────────────
-        $dailyCount = $orders->filter(fn ($o) => optional($o->CreatedAt)->toDateString() === $today)->count();
+        $dailyCount = $orders->filter(fn($o) => optional($o->CreatedAt)->toDateString() === $today)->count();
 
         $customerWise = $orders->groupBy('CustomerId')->map(function ($g) {
             $first = $g->first();
             return [
                 'customer' => $first->customer->Name ?? '—',
-                'count'    => $g->count(),
-                'value'    => (float) $g->sum('TotalAmount'),
+                'count' => $g->count(),
+                'value' => (float) $g->sum('TotalAmount'),
             ];
         })->sortByDesc('value')->take(10)->values();
 
@@ -149,16 +210,16 @@ class DashboardController extends Controller
             $first = $g->first();
             return [
                 'product' => $first->product->Name ?? '—',
-                'count'   => $g->count(),
-                'qty'     => (int) $g->sum('Quantity'),
+                'count' => $g->count(),
+                'qty' => (int) $g->sum('Quantity'),
             ];
         })->sortByDesc('qty')->take(10)->values();
 
         // ── 3. Dispatch Status ──────────────────────────────────────────
         $dispatchStatus = [
-            'dispatched'      => $orders->where('Status', 'dispatched')->count(),
+            'dispatched' => $orders->where('Status', 'dispatched')->count(),
             'pendingDispatch' => $orders->whereIn('Status', ['approved', 'processing'])->count(),
-            'delivered'       => $orders->where('Status', 'delivered')->count(),
+            'delivered' => $orders->where('Status', 'delivered')->count(),
         ];
 
         // ── 4. Previous Day Pending Dispatch + aging ────────────────────
@@ -168,57 +229,60 @@ class DashboardController extends Controller
         foreach ($pendingDispatchOrders as $o) {
             $reference = $o->UpdatedAt ?? $o->CreatedAt;
             $days = $reference ? now()->diffInDays(Carbon::parse($reference)) : 0;
-            if ($days <= 1) $aging['0-1']++;
-            elseif ($days <= 3) $aging['2-3']++;
-            else $aging['4+']++;
+            if ($days <= 1)
+                $aging['0-1']++;
+            elseif ($days <= 3)
+                $aging['2-3']++;
+            else
+                $aging['4+']++;
 
             $agingList[] = [
-                'code'     => $o->Code,
+                'code' => $o->Code,
                 'customer' => $o->customer->Name ?? '—',
-                'status'   => $o->Status,
-                'days'     => $days,
+                'status' => $o->Status,
+                'days' => $days,
             ];
         }
-        usort($agingList, fn ($a, $b) => $b['days'] <=> $a['days']);
+        usort($agingList, fn($a, $b) => $b['days'] <=> $a['days']);
 
         // ── 5. Enquiries Awaiting Due to Stock Shortage ─────────────────
         $stockShortage = $orders->where('Status', 'pending')->filter(function ($o) {
             return $o->product && $o->Quantity > ($o->product->Quantity ?? 0);
-        })->map(fn ($o) => [
-            'code'      => $o->Code,
-            'customer'  => $o->customer->Name ?? '—',
-            'product'   => $o->product->Name ?? '—',
-            'requested' => (int) $o->Quantity,
-            'available' => (int) ($o->product->Quantity ?? 0),
-        ])->values();
+        })->map(fn($o) => [
+                'code' => $o->Code,
+                'customer' => $o->customer->Name ?? '—',
+                'product' => $o->product->Name ?? '—',
+                'requested' => (int) $o->Quantity,
+                'available' => (int) ($o->product->Quantity ?? 0),
+            ])->values();
 
         // ── 6. Sales Loss Indication ─────────────────────────────────────
         $declined = $orders->where('Status', 'declined');
         $salesLoss = [
             'count' => $declined->count(),
             'value' => (float) $declined->sum('TotalAmount'),
-            'list'  => $declined->map(fn ($o) => [
-                'code'     => $o->Code,
+            'list' => $declined->map(fn($o) => [
+                'code' => $o->Code,
                 'customer' => $o->customer->Name ?? '—',
-                'value'    => (float) $o->TotalAmount,
-                'notes'    => $o->Notes,
+                'value' => (float) $o->TotalAmount,
+                'notes' => $o->Notes,
             ])->values(),
         ];
 
         // ── 7. Invalid Indent List (proxy: possible duplicate pending) ──
-        $duplicates = $orders->groupBy(fn ($o) => $o->CustomerId . '-' . $o->ProductId)
-            ->filter(fn ($g) => $g->where('Status', 'pending')->count() > 1)
+        $duplicates = $orders->groupBy(fn($o) => $o->CustomerId . '-' . $o->ProductId)
+            ->filter(fn($g) => $g->where('Status', 'pending')->count() > 1)
             ->map(function ($g) {
                 $first = $g->first();
                 return [
                     'customer' => $first->customer->Name ?? '—',
-                    'product'  => $first->product->Name ?? '—',
-                    'count'    => $g->where('Status', 'pending')->count(),
+                    'product' => $first->product->Name ?? '—',
+                    'count' => $g->where('Status', 'pending')->count(),
                 ];
             })->values();
 
         // ── 8. Long Pending Orders (>=3 days, approved/processing) ──────
-        $longPending = collect($agingList)->filter(fn ($a) => $a['days'] >= 3)->take(10)->values();
+        $longPending = collect($agingList)->filter(fn($a) => $a['days'] >= 3)->take(10)->values();
 
         // ── 9. Order Summary (real counts backing the "Order Summary"
         // card row on the admin/sysadmin dashboard). "Rejected indents"
@@ -226,30 +290,30 @@ class DashboardController extends Controller
         // it reuses the same possible-duplicate-pending heuristic as
         // "possibleDuplicates" above.
         $orderSummary = [
-            'total'           => $orders->count(),
-            'pending'         => $orders->where('Status', 'pending')->count(),
-            'approved'        => $orders->whereIn('Status', ['approved', 'processing', 'dispatched', 'delivered'])->count(),
-            'rejected'        => $orders->where('Status', 'declined')->count(),
+            'total' => $orders->count(),
+            'pending' => $orders->where('Status', 'pending')->count(),
+            'approved' => $orders->whereIn('Status', ['approved', 'processing', 'dispatched', 'delivered'])->count(),
+            'rejected' => $orders->where('Status', 'declined')->count(),
             'rejectedIndents' => $duplicates->count(),
         ];
 
         return response()->json([
-            'enquiryStatus'        => $enquiryStatus,
-            'orderSummary'         => $orderSummary,
-            'ordersPlaced'         => [
-                'today'        => $dailyCount,
+            'enquiryStatus' => $enquiryStatus,
+            'orderSummary' => $orderSummary,
+            'ordersPlaced' => [
+                'today' => $dailyCount,
                 'customerWise' => $customerWise,
-                'productWise'  => $productWise,
+                'productWise' => $productWise,
             ],
-            'dispatchStatus'       => $dispatchStatus,
+            'dispatchStatus' => $dispatchStatus,
             'pendingDispatchAging' => [
                 'buckets' => $aging,
-                'list'    => array_slice($agingList, 0, 10),
+                'list' => array_slice($agingList, 0, 10),
             ],
-            'stockShortage'        => $stockShortage,
-            'salesLoss'            => $salesLoss,
-            'possibleDuplicates'   => $duplicates,
-            'longPendingOrders'    => $longPending,
+            'stockShortage' => $stockShortage,
+            'salesLoss' => $salesLoss,
+            'possibleDuplicates' => $duplicates,
+            'longPendingOrders' => $longPending,
             'note' => 'Partial-dispatch quantities, stock-shortage, sales-loss reasons, and duplicate detection are approximate until dedicated Enquiry/Allocation tracking is built.',
         ]);
     }
@@ -314,28 +378,28 @@ class DashboardController extends Controller
             }
 
             return [
-                'customerId'       => $c->Id,
-                'code'             => $c->Code,
-                'name'             => $c->Name,
-                'creditLimit'      => (float) ($c->CreditLimit ?? 0),
-                'outstanding'      => (float) ($c->Outstanding ?? 0),
-                'utilisationPct'   => $utilisation,
-                'overdueOrders'    => $overdue->count(),
-                'overdueAmount'    => (float) $overdue->sum('TotalAmount'),
-                'openComplaints'   => $complaints->count(),
-                'ordersOnHold'     => $holds->count(),
-                'status'           => $status,
+                'customerId' => $c->Id,
+                'code' => $c->Code,
+                'name' => $c->Name,
+                'creditLimit' => (float) ($c->CreditLimit ?? 0),
+                'outstanding' => (float) ($c->Outstanding ?? 0),
+                'utilisationPct' => $utilisation,
+                'overdueOrders' => $overdue->count(),
+                'overdueAmount' => (float) $overdue->sum('TotalAmount'),
+                'openComplaints' => $complaints->count(),
+                'ordersOnHold' => $holds->count(),
+                'status' => $status,
             ];
         })
-        ->sortBy(fn ($r) => ['Hold' => 0, 'Watch' => 1, 'Good' => 2][$r['status']])
-        ->values();
+            ->sortBy(fn($r) => ['Hold' => 0, 'Watch' => 1, 'Good' => 2][$r['status']])
+            ->values();
 
         return response()->json([
             'summary' => [
                 'total' => $rows->count(),
-                'hold'  => $rows->where('status', 'Hold')->count(),
+                'hold' => $rows->where('status', 'Hold')->count(),
                 'watch' => $rows->where('status', 'Watch')->count(),
-                'good'  => $rows->where('status', 'Good')->count(),
+                'good' => $rows->where('status', 'Good')->count(),
             ],
             'customers' => $rows,
         ]);
@@ -351,12 +415,12 @@ class DashboardController extends Controller
         $value = $employee->{$field} ?? $caller->{$field} ?? null;
 
         if (is_array($value)) {
-            return array_values(array_filter($value, fn ($v) => $v !== null && $v !== ''));
+            return array_values(array_filter($value, fn($v) => $v !== null && $v !== ''));
         }
         if (is_string($value) && $value !== '') {
             $decoded = json_decode($value, true);
             if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                return array_values(array_filter($decoded, fn ($v) => $v !== null && $v !== ''));
+                return array_values(array_filter($decoded, fn($v) => $v !== null && $v !== ''));
             }
             return [$value];
         }

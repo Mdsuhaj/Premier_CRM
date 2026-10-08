@@ -1,230 +1,87 @@
 // src/pages/master/Batches.jsx
 //
 // Marketing Review — Quantity Allocation + Final Approval console.
-// One product currently has live customer demand (Orders in pending/
-// approved/processing status); an Admin allocates available stock to each
-// customer and clicks "Approval" — that hands every touched row to a
-// System Admin as Status = 'pending' (server-side, on product_allocations
-// — see AllocationController@store). The System Admin then reviews each
-// row with a tick (Approve) / cross (Reject) in the Actions column, can
-// leave Remarks, and — once a row is Approved — uses the separate
-// "Transfer to ERP" button to push it to ERP (ErpStatus flips to
-// 'erp_so_created' only on that explicit click, not automatically the
-// moment a row is Approved).
+// Admin allocates available stock to each order line and clicks "Approval";
+// that hands the row to System Admin as Status = 'pending'. System Admin
+// approves / rejects (Actions column), can leave Remarks, and pushes Approved
+// rows to ERP with "Transfer to ERP". Every allocation is keyed by
+// (ProductId, OrderId) on the server, so orders never share qty/status.
 //
-// Removed per the latest brief: the "Allot Stock to Customer" side-form,
-// the bulk "Auto-Allocate <tab> Items" button, the illustrative Allocation
-// Legend panel and Approval Workflow stepper panel — none of these are
-// needed any more.
+// Allocation Status is role-specific: Admin sees the stock position (Fully /
+// Partial / Not Allocated / Stock Shortage); System Admin sees the approval
+// state (Pending / Approved / Rejected / Not Submitted).
 //
-// "Inquiry No." is gone — every row now shows the real Order No. Each
-// active Order is its own row (a customer with two separate Orders for
-// the same product shows up as two lines, not merged into one) — resolved
-// server-side in AllocationController@index.
+// Meter column: free-text manual figure per order. Available Stock is consumed
+// at (Allocated Cases × Allocated Mtr); a row with no Mtr does not draw stock.
+// CD Flag is a per-row Yes/No dropdown (client-side for now).
 //
-// ── PER-ORDER ALLOCATION (fixed) ────────────────────────────────────────
-// Previously the underlying allocation (qty/status/remarks/ERP state) was
-// still tracked per (Product, Customer) only, with no OrderId on
-// product_allocations — so a customer with two active Orders for the same
-// product had both rows read off the SAME allocation record. That caused
-// two visible bugs:
-//   - A brand-new Order could show up already "Rejected" (or carrying a
-//     stray Allocated Qty) purely because it inherited an older, unrelated
-//     Order's saved status/qty for that customer+product.
-//   - Requested vs Allocated could visibly disagree (e.g. "Requested 10,
-//     Allocated 12") because the 12 was really the SUM across two orders,
-//     shown against just one of their Requested figures.
-// Fix: product_allocations now carries OrderId, and the server keys every
-// allocation lookup/write by (ProductId, OrderId) — see
-// AllocationController@store / @index / @board / @decision etc. Each
-// Order is now fully independent: its own AllocatedQty, its own Status,
-// its own ERP state. This file's handleSaveAll() below sends one entry
-// per Order (orderId + customerId + allocatedQty) instead of the old
-// "aggregate by customerId" workaround.
+// Partial orders: a partially allocated order (some qty saved, some still
+// owed) gets a chevron in its first column. Opening it shows a "balance" row
+// underneath where the remaining qty is allocated. The order stays on this
+// board for 48 hours from its first allocation.
 //
-// Allocation Status is role-specific:
-//   - Admin sees a stock-position read: Fully Allocated / Partial
-//     Allocated / Not Allocated / Stock Shortage (purely a function of
-//     Allocated vs Requested vs Available — no approve/reject button in
-//     this column). Not Allocated = nothing allocated yet but stock is
-//     available; Stock Shortage = nothing allocated and none available
-//     either. Fully Allocated = green, Partial Allocated = orange, Not
-//     Allocated = neutral grey, Stock Shortage = red; the Available Stock
-//     figure right next to it is tinted the same color so the two always
-//     agree at a glance (see stockColor()).
-//   - System Admin sees the real approval state, read-only: Pending /
-//     Approved / Rejected (or "Not Submitted" if nothing's been saved for
-//     that row yet) — changing it happens only via the Actions column.
-//
-// System Admin gets three extra columns:
-//   1. Actions — a tick (Approve) / cross (Reject), enabled only while the
-//      row is Pending. Calls PATCH /allocations/{id}/decision.
-//   2. Remarks — a free-text field, saved on blur (independent of the
-//      approve/reject decision — can be filled in at any time).
-//   3. ERP SO Status — read-only, three states: "Not Transferred" (not
-//      yet Approved), "Ready for ERP" (ticked/Approved but not yet
-//      pushed), and "ERP SO Created" (after the separate "Transfer to
-//      ERP" button pushes every Approved, not-yet-transferred row to ERP
-//      in one batch — POST /allocations/bulk-erp-transfer). Approving a
-//      row (tick) only sets its Status to Approved and flips this column
-//      to "Ready for ERP" — the ERP handoff itself is a later, deliberate
-//      click on its own button.
-//
-// ── CARRY-OVER ALLOCATION FIX ────────────────────────────────────────
-// A row's underlying `savedAllocated` figure is CUMULATIVE — it's every
-// unit ever allocated to that Order, not just "what's still outstanding".
-// Before this fix, the qty input box always showed that full cumulative
-// figure, which meant: allocate 700 of 800 → approve → transfer to ERP →
-// come back later and the box still shows 700 (correct so far), but
-// there's no way to tell the difference between "700 is still sitting
-// there waiting to be dealt with" and "700 has ALREADY been fully
-// approved + pushed to ERP, and only the remaining 100 is new work".
-// Editing the box in that second case silently overwrote the server's
-// stored qty with box-value-only instead of adding to it.
-//
-// Fix: once a row has erpStatus === 'erp_so_created' AND there is still
-// outstanding qty against the order (savedAllocated < requested), the
-// input box represents a fresh INCREMENT on top of the locked-in base,
-// starting at 0 — see allocFor() vs totalAllocFor() below. allocFor() is
-// what the editable <input> shows/edits; totalAllocFor() is the real
-// cumulative total and is what every other calculation (available stock,
-// pending qty, value, status badge, and the payload sent to the server on
-// Approval) must use. This also depends on the backend flipping
-// ErpStatus back off 'erp_so_created' the next time AllocatedQty
-// increases past what was actually transferred — see the note above
-// handleSaveAll().
-//
-// ── "FULLY ALLOCATED BUT BOX SHOWS 0" FIX ─────────────────────────────
-// The carry-over reset above used to fire for ANY row at
-// erpStatus === 'erp_so_created', including ones that were already fully
-// allocated (savedAllocated >= requested) — there's no "new work" left
-// on those, so resetting the box to 0 made a row tagged "Fully Allocated"
-// look like nothing had been allocated at all (the box, the badge, and
-// the Total Value column all visually disagreed). Fixed by only treating
-// the row as "start a fresh increment at 0" when it's BOTH at ERP AND
-// still short of its requested qty.
-//
-// ── FULLY-ALLOCATED ROWS ARE NOW VIEW-ONLY (latest) ───────────────────
-// Any row whose real cumulative total (totalAllocFor(r)) has reached its
-// Requested Qty — for EITHER role, not just Admin — no longer shows an
-// editable input at all. It renders as a plain colored number instead
-// (green, matching the "Fully Allocated" tag color everywhere else on
-// this page), since there's nothing left to type and an editable-but-
-// always-clamped-to-max box was misleading. See isFullyAllocated in
-// AllocationRow below.
-//
-// ── PENDING / PARTIALLY ALLOCATED FIRST ─────────────────────────────
-// Rows now sort with the ones that still need attention at the very top,
-// both in Customer Wise View (visibleRows) and Product Wise View
-// (productGroups):
-//   - System Admin: Not Submitted / Pending decisions first, then
-//     anything still short of its requested qty, then everything else
-//     (Approved/Rejected AND fully allocated).
-//   - Admin: Not Allocated / Stock Shortage / Partial Allocated first,
-//     then Fully Allocated.
-// See rowPriority()/groupPriority() below. This is a pure display sort —
-// it doesn't change what's selected, saved, or how filters work.
-//
-// A global search bar sits above the "Showing <tab> items only" note,
-// searching product/customer name+code and Order No. across every visible
-// row. Region now lists real taluks (GET /locations/taluks, aggregated
-// across every district) and Sales Officer lists real End Users / Field
-// Officers (GET /employees?role=end_user) — both filter the table.
-//
-// Product Wise View's header (S.No / Sort No. / Shade No. / Product Code /
-// Product Name / Requested / Available / Allocated / Total Value /
-// Allocation Status, plus System Admin's Actions / Remarks / ERP SO
-// Status) is now ALWAYS fully visible — every product's row shows real
-// totals added up across every customer on it, not just Code/Sort/Shade
-// with everything else hidden behind a click. Clicking a product still
-// expands it to show the per-customer breakdown underneath (Order No.,
-// Customer Name, Customer Code, and that customer's own figures), but you
-// no longer have to expand just to see a product's numbers. Customer Wise
-// View leads with S.No / Order No. / Customer Code / Product Code before
-// Customer Name / Product Description. System Admin's Actions cell on the
-// totals row is a bulk Approve/Reject scoped to that product's own
-// Pending rows; Remarks shows a filled-count (editing stays per-customer,
-// inside the expanded rows); ERP SO Status shows "ERP SO Created" once
-// every customer on that product has been transferred, "Partially
-// Transferred" if only some have, else "Not Transferred". Sort No. is a
-// plain running sequence (1, 2, 3…) ordered by Product Code — deliberately
-// its own value, not a repeat of the Code; Shade No. falls back to the
-// same rotating placeholder list used there when the backend hasn't set
-// one. S.No is a simple 1-based row/group index over whatever is currently
-// visible (filters/search applied) — purely cosmetic, distinct from Sort
-// No. The Product Wise View's expand/collapse chevron now sits in the
-// S.No cell (before the row number) rather than next to the Product Code,
-// so it's the first thing in the row.
-//
-// Whenever a row sits between "some allocated" and "fully allocated", a
-// dismiss-free alert strip lists every such order (product, order no,
-// customer, and the exact remaining/pending qty) right above the table,
-// so a partially-fulfilled order is never quietly missed — see
-// partialAlerts below. This uses the same requested-vs-allocated math the
-// table itself uses, so it also reflects unsaved in-progress edits.
-//
-// ── NEW ALERT STRIPS (latest) ─────────────────────────────────────────
-// System Admin now also sees three more dismiss-free strips, same style
-// as partialAlerts: Approved orders, Rejected orders, and orders with
-// ERP SO Created — see approvedAlerts / rejectedAlerts / erpCreatedAlerts
-// below. Admin (who has no Remarks column of their own — that's System-
-// Admin-only) instead sees a strip surfacing any row they've allocated
-// stock to that System Admin has left a remark on, so that feedback
-// isn't otherwise invisible to them — see adminRemarksAlerts below.
-//
-// ── ALERTS NOW A POPUP MODAL (latest) ───────────────────────────────
-// The above alert strips (partialAlerts / approvedAlerts / rejectedAlerts
-// / erpCreatedAlerts / adminRemarksAlerts) no longer render as
-// always-visible inline cards above the table. Instead they're grouped
-// into a single centered popup dialog (AlertModal below) with OK / Cancel
-// buttons that either dismisses it — it auto-opens once after the board
-// finishes loading if there's anything to show (see the alertModalOpen
-// effect), rather than permanently occupying space on the page.
-//
-// The four stat cards at the top are ROLE-SPECIFIC (see the two mockups):
-//   - System Admin: Pending Final Approval / Approved Orders Today /
-//     Total Order Value / ERP Transfer Pending — reflecting the final
-//     approval + ERP handoff work that's theirs alone.
-//   - Admin: Today's Inquiries / Pending Allocation / Available Stock /
-//     Awaiting Approval — reflecting the allocation work that's theirs:
-//     how much fresh demand came in, how much of it still needs stock
-//     allocated, how much stock is left to allocate with, and how much
-//     of what they've already submitted is still sitting with the System
-//     Admin. Each card still has a "View Details" link that opens the
-//     Sales Order page (`/master/sales-order?view=...`), but Admin's four
-//     cards point at a *different* set of view ids than System Admin's —
-//     see SalesOrder.jsx, which now branches its tabs/columns by role too.
-import { useEffect, useMemo, useState, Fragment } from "react";
-import { useNavigate } from "react-router-dom";
+// ── CHANGES IN THIS VERSION ──
+// 1. Allocated Mtr can only be entered after Allocated Qty (alert otherwise).
+//    Clearing the qty also clears the Mtr.
+// 2. Partial orders (within the 48h window) sort to the top, newest first.
+//    Only the PARENT row is orange; the balance (dropdown) row is white like
+//    other rows, and neither changes colour on hover.
+// 3. Admin submit: inputs of products that failed are kept (only submitted
+//    rows are cleared), and the page scrolls up so the message is visible.
+// 4. CD Flag / Price reversed: the partial parent is editable until submitted
+//    and read-only after; the balance row's CD Flag / Price is editable.
+// 5. Category pills always appear in the order Dhoti → Blouse → Uniform
+//    Shirting → Uniform Suiting → Others, evenly spaced.
+// 6. Allocated Mtr is capped: (Allocated Qty × Mtr) can never exceed the stock
+//    left. Typing a bigger Mtr snaps it to the maximum allowed, so Available
+//    Stock stops at 0 instead of going negative (see setMeter).
+// 7. TOTAL MTR: the Allocated Mtr column now totals Allocated Qty × Mtr —
+//    per product (product group row), and as the grand total in the footer
+//    "Total" row, the Allocation Summary bar, Excel export and print.
+// 8. Delivery Point now comes from the API as "<number> <name>" (backend
+//    sends deliveryPointNo / deliveryPointName / deliveryPoint).
+// 9. PRODUCT CODE / PRODUCT NAME: only the first 5 words are shown, followed
+//    by "...". Hovering shows a card with the full Product Code and Product
+//    Name. Applies to Admin + System Admin, Product Wise + Customer Wise
+//    (see truncateWords() and the <HoverCard> component at the bottom).
+import { useEffect, useMemo, useRef, useState, Fragment } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   ClipboardList, PackageCheck, Hourglass, Search,
   Shirt, Layers, Briefcase, LayoutGrid, Send, RotateCcw,
   Zap, ChevronRight, ChevronDown, Check, X, Package, CircleDot, Triangle,
   Ruler, FileDown, Printer, FileText, ArrowUpRight, Truck, AlertTriangle,
+  ShoppingCart,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import Layout from "../../components/AppLayout";
 import API from "../../services/api";
+import { INDIA_STATES, districtsOfState, stateOfDistrict, sameName } from "../../data/indiaStatesDistricts";
 
-const ACTIVE_ORDER_STATUSES = ["pending", "approved", "processing"];
-
-// Local draft of in-progress qty/remarks edits — purely a convenience so a
-// refresh doesn't lose typing; "Approval" is still what actually persists
-// to the server.
 const DRAFT_STORAGE_KEY = "premier_mr_draft";
+const PARTIAL_WINDOW_HOURS = 48;
+const DEFAULT_PRICE_CODE = "DOMESTIC";
+// Orange used for the PARTIAL PARENT row only (the balance row stays white).
+const PARTIAL_ROW_BG = "#FFF6E5";
 
-// Allocation Status filter — options shown in the dropdown embedded in
-// the table's "Allocation Status" column header, mapped straight onto
-// each row's underlying r.status value (pending / approved / rejected).
-// Available to both Admin and System Admin, independent of which
-// role-specific badge (stock-position vs approval-state) is shown in the
-// table body itself.
-const ALLOCATION_STATUS_OPTIONS = [
+const ADMIN_STATUS_OPTIONS = [
+  { value: "", label: "All" },
+  { value: "fully_allocated", label: "Fully Allocated" },
+  { value: "partial_allocated", label: "Partial Allocated" },
+  { value: "not_allocated", label: "Not Allocated" },
+  { value: "stock_shortage", label: "Stock Shortage" },
+];
+const SYSADMIN_STATUS_OPTIONS = [
   { value: "", label: "All" },
   { value: "pending", label: "Pending" },
   { value: "approved", label: "Approved" },
   { value: "rejected", label: "Rejected" },
 ];
+
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
+}
 
 // ── Category tabs ─────────────────────────────────────────────────────
 const CLOTH_GROUPS = [
@@ -250,7 +107,6 @@ const FALLBACK_TAB_COLORS = [
 function getCategoryGroups() {
   const topCat = (localStorage.getItem("premier_category") || "cloth").toLowerCase();
   const base = topCat === "yarn" ? YARN_GROUPS : CLOTH_GROUPS;
-
   let custom = {};
   try {
     const raw = localStorage.getItem(CUSTOM_SUBTYPES_KEY);
@@ -267,7 +123,6 @@ function getCategoryGroups() {
       icon: LayoutGrid,
       ...FALLBACK_TAB_COLORS[i % FALLBACK_TAB_COLORS.length],
     }));
-
   return [...base, ...extra];
 }
 
@@ -284,39 +139,81 @@ const groupFor = (subType, groups) => {
 const warehouseFor = (subType) =>
   normalize(subType) === "blouse" ? "Rack Stock" : "EB4 Dispatch Warehouse";
 
-// Sort No. is a running sequence number computed in loadBoard() (ordered
-// by Product Code, but a distinct value from it — see sortNoByProduct).
-// Shade No. uses the same rotating placeholder list as ProductCatalog.jsx
-// / ProductSelection.jsx when the backend hasn't set a real one, so a
-// product looks consistent across every screen it appears on.
 const DUMMY_SHADE_NOS = ["SH-101", "SH-102", "SH-103", "SH-104", "SH-105", "SH-106"];
-// Fallback only — used if a product somehow isn't in the sortNoByProduct
-// map built in loadBoard(). The real Sort No. is a running sequence
-// number (1, 2, 3…), not the Product Code.
 const sortNoFallback = (product) => product?.Code || "—";
 const shadeNoFor = (product, seed) => product?.ShadeNo || DUMMY_SHADE_NOS[seed % DUMMY_SHADE_NOS.length];
 
-// Today's date as YYYY-MM-DD, for the "Approved Orders Today" /
-// "Today's Inquiries" stats.
+// ── Dummy Tax / Payment / Delivery Point (CD Flag is a real dropdown) ──
+const DUMMY_TAX = ["5%", "12%", "18%", "28%"];
+const DUMMY_PAYMENT_TERMS = ["Advance", "Credit 15 Days", "Credit 30 Days", "Credit 45 Days"];
+const DUMMY_DELIVERY_POINTS = ["Madurai Warehouse", "EB4 Dispatch Warehouse", "Customer Godown", "Direct Ex-Mill"];
+function seedFromKey(key) {
+  let h = 0;
+  const s = String(key || "");
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+const dummyTax = (key) => DUMMY_TAX[seedFromKey(key) % DUMMY_TAX.length];
+const dummyPayment = (key) => DUMMY_PAYMENT_TERMS[seedFromKey(`${key}-pay`) % DUMMY_PAYMENT_TERMS.length];
+const dummyDeliveryPoint = (key) => DUMMY_DELIVERY_POINTS[seedFromKey(`${key}-dp`) % DUMMY_DELIVERY_POINTS.length];
+
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
-// ── Stock-position read (Admin's "Allocation Status") ───────────────────
-// Fully Allocated = green, Partial Allocated = orange, Not Allocated =
-// neutral grey (stock is there, nothing's been assigned to this order
-// yet), Stock Shortage = red (nothing allocated AND nothing available).
-// Pure functions (no component state), so both the main table and the
-// standalone AllocationRow component below can share them, and the
-// Available Stock figure can be tinted with the exact same scale via
-// stockColor() — see the hex values below, which mirror the .tag-success /
-// .tag-pending / .tag-hold / .tag-neutral text colors in index.css.
-const stockStatus = (row, available, allocated) => {
-  if (allocated <= 0) {
-    if (available <= 0) return { label: "Stock Shortage", cls: "tag-hold" };
-    return { label: "Not Allocated", cls: "tag-neutral" };
-  }
-  if (allocated >= row.requested) return { label: "Fully Allocated", cls: "tag-success" };
-  return { label: "Partial Allocated", cls: "tag-pending" };
+const formatEnquiryDate = (d) => {
+  if (!d) return "—";
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? d : dt.toLocaleDateString("en-GB");
 };
+
+// ── 48-hour partial window helpers ─────────────────────────────────────
+const hoursSince = (iso) => {
+  if (!iso) return null;
+  const t = new Date(String(iso).replace(" ", "T")).getTime();
+  return isNaN(t) ? null : (Date.now() - t) / 36e5;
+};
+// Partial = something already SAVED against the order, but not all of it.
+const isPartialRow = (r) => r.savedAllocated > 0 && r.savedAllocated < r.requested;
+// Hours left in the 48h window; null when there's no allocation timestamp yet.
+const partialHoursLeft = (r) => {
+  const age = hoursSince(r.firstAllocatedAt);
+  return age === null ? null : PARTIAL_WINDOW_HOURS - age;
+};
+// A partial order whose 48h window has run out — it leaves this board.
+const isExpiredPartial = (r) => {
+  if (!isPartialRow(r)) return false;
+  const left = partialHoursLeft(r);
+  return left !== null && left <= 0;
+};
+const fmtLeft = (h) =>
+  h === null ? "" : h <= 0 ? "48h window over" : h >= 24 ? `${Math.floor(h / 24)}d ${Math.floor(h % 24)}h left` : `${Math.max(1, Math.floor(h))}h left`;
+
+const stockStatusKey = (row, available, allocated) => {
+  if (allocated <= 0) {
+    if (available <= 0) return "stock_shortage";
+    return "not_allocated";
+  }
+  if (allocated >= row.requested) return "fully_allocated";
+  return "partial_allocated";
+};
+const STOCK_STATUS_META = {
+  stock_shortage: { label: "Stock Shortage", cls: "tag-hold" },
+  not_allocated: { label: "Not Allocated", cls: "tag-neutral" },
+  fully_allocated: { label: "Fully Allocated", cls: "tag-success" },
+  partial_allocated: { label: "Partial Allocated", cls: "tag-pending" },
+};
+const approvalStatusKey = (row) => {
+  if (!row.allocationId) return "not_submitted";
+  if (row.status === "approved") return "approved";
+  if (row.status === "rejected") return "rejected";
+  return "pending";
+};
+const APPROVAL_STATUS_META = {
+  not_submitted: { label: "Not Submitted", cls: "tag-neutral" },
+  pending: { label: "Pending", cls: "tag-pending" },
+  approved: { label: "Approved", cls: "tag-approved" },
+  rejected: { label: "Rejected", cls: "tag-hold" },
+};
+const stockStatus = (row, available, allocated) => STOCK_STATUS_META[stockStatusKey(row, available, allocated)];
 const groupStockStatus = (g) => {
   if (g.allocatedSum <= 0) {
     if (g.poolAvailable <= 0) return { label: "Stock Shortage", cls: "tag-hold" };
@@ -327,18 +224,49 @@ const groupStockStatus = (g) => {
 };
 const stockColor = (requested, available, allocated) => {
   if (allocated <= 0) {
-    if (available <= 0) return "#B23A3A"; // matches .tag-hold — Stock Shortage
-    return "#6B7785"; // matches .tag-neutral — Not Allocated
+    if (available <= 0) return "#B23A3A";
+    return "#6B7785";
   }
-  if (allocated >= requested) return "#1C7A4B"; // matches .tag-success — Fully Allocated
-  return "#8A5A0E"; // matches .tag-pending — Partial Allocated
+  if (allocated >= requested) return "#1C7A4B";
+  return "#8A5A0E";
+};
+
+const numOr1 = (v) => {
+  const n = parseFloat(String(v).replace(/[^\d.]/g, ""));
+  return !isNaN(n) && n > 0 ? n : 1;
+};
+
+// Free-text Mtr ("5M", "5.5", "") → number. No usable Mtr = 0 (draws nothing).
+const mtrNum = (v) => {
+  const n = parseFloat(String(v ?? "").replace(/[^\d.]/g, ""));
+  return !isNaN(n) && n > 0 ? n : 0;
+};
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+// Total-Mtr display: "—" when nothing is allocated yet.
+const fmtMtr = (n) => (n > 0 ? `${round2(n).toLocaleString()}M` : "—");
+
+// Product Code / Product Name display: first 5 words, then "...".
+// The full text is shown in the hover card (see <HoverCard> at the bottom).
+const PRODUCT_TEXT_WORD_LIMIT = 5;
+const truncateWords = (text, limit = PRODUCT_TEXT_WORD_LIMIT) => {
+  const s = String(text ?? "").trim();
+  if (!s) return "—";
+  const words = s.split(/\s+/);
+  return words.length > limit ? `${words.slice(0, limit).join(" ")}...` : s;
 };
 
 export default function Batches() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const role = localStorage.getItem("role") || "";
   const canManage = ["admin", "system_admin"].includes(role);
   const isSystemAdminRole = role === "system_admin";
+
+  // From Order List's "Allocated" action: /master/batches?enquiry=ORD-1045&focus=45,46
+  const focusEnquiry = searchParams.get("enquiry") || "";
+  const [focusIds, setFocusIds] = useState(() =>
+    (searchParams.get("focus") || "").split(",").map((s) => s.trim()).filter(Boolean)
+  );
 
   const CATEGORY_GROUPS = useMemo(() => getCategoryGroups(), []);
 
@@ -349,53 +277,78 @@ export default function Batches() {
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
 
-  const [activeCat, setActiveCat] = useState(() => CATEGORY_GROUPS[0]?.id || "all");
+  // When arriving from Order List, start on "All" so the order isn't hidden
+  // behind another category tab.
+  const [activeCat, setActiveCat] = useState(() =>
+    (searchParams.get("focus") ? "all" : (CATEGORY_GROUPS[0]?.id || "all"))
+  );
   const [viewBy, setViewBy] = useState("customer");
   const [globalSearch, setGlobalSearch] = useState("");
   const [customerSearch, setCustomerSearch] = useState("");
+  const [enquiryNoSearch, setEnquiryNoSearch] = useState("");
   const [productSearch, setProductSearch] = useState("");
   const [inquiryDate, setInquiryDate] = useState("");
-  const [regionFilter, setRegionFilter] = useState("");
+  // State + District filters (all India). District list follows the chosen State.
+  const [stateFilter, setStateFilter] = useState("");
+  const [districtFilter, setDistrictFilter] = useState("");
   const [officerFilter, setOfficerFilter] = useState("");
   const [allocStatusFilter, setAllocStatusFilter] = useState("");
+  const [uomStatusFilter, setUomStatusFilter] = useState("");
   const [allocInputs, setAllocInputs] = useState({});
   const [remarksInputs, setRemarksInputs] = useState({});
-  const [busyDecision, setBusyDecision] = useState(() => new Set()); // allocationIds mid-request
+  const [meterInputs, setMeterInputs] = useState({});
+  const [cdFlagInputs, setCdFlagInputs] = useState({});
+  const [priceCodeInputs, setPriceCodeInputs] = useState({});
+  const [priceCodeOptions, setPriceCodeOptions] = useState(["TLODOM", "DOMESTIC"]);
+  const [busyDecision, setBusyDecision] = useState(() => new Set());
   const [expandedProducts, setExpandedProducts] = useState({});
   const [selectedRows, setSelectedRows] = useState(() => new Set());
 
-  const [regionOptions, setRegionOptions] = useState([]);
+  const [expandedPartials, setExpandedPartials] = useState({});
   const [officerOptions, setOfficerOptions] = useState([]);
 
-  // Popup alert modal — replaces the old always-visible inline strips.
-  // Auto-opens once (per board load) if there's anything worth showing.
   const [alertModalOpen, setAlertModalOpen] = useState(false);
 
   // ---- Data loading -----------------------------------------------------
+  // Request counter: only the LATEST loadBoard() call may update state, so
+  // overlapping refreshes can't leave the page stuck on "Loading…" or show
+  // older data over newer data.
+  const boardReqRef = useRef(0);
   const loadBoard = async () => {
+    const reqId = ++boardReqRef.current;
     setLoading(true); setError("");
     try {
       const boardRes = await API.get("/allocations/board");
+      if (reqId !== boardReqRef.current) return;
       const activeProducts = boardRes.data?.products || [];
 
       const flat = [];
       activeProducts.forEach((p) => {
-        const poolAvailable = Math.max(0, (p.availableQty || 0) - (p.totalAllocated || 0));
         const subType = p.subType || p.category;
-        (p.customers || []).forEach((c) => {
-          const rowAvailable = poolAvailable + (c.allocatedQty || 0);
+        const productUom = p.uom || p.UOM || "";
+        const customersArr = p.customers || [];
+        const meterMultOf = (c) => {
+          const n = parseFloat(String(c.meters || "").replace(/[^\d.]/g, ""));
+          return !isNaN(n) && n > 0 ? n : 0;
+        };
+        const usedOf = (c) => (c.totalMtr != null ? Number(c.totalMtr) : (c.allocatedQty || 0) * meterMultOf(c));
+        const totalConsumed = customersArr.reduce((sum, c) => sum + usedOf(c), 0);
+        const poolAvailable = Math.max(0, (p.availableQty || 0) - totalConsumed);
+        customersArr.forEach((c) => {
+          const rowAvailable = poolAvailable + usedOf(c);
+          const uom = c.uom || productUom;
           flat.push({
-            // Each active Order is now its own row (see
-            // AllocationController@index) — key by order, not just
-            // customer, so two Orders from the same customer for the
-            // same product don't collide/merge in the UI.
             key: `${p.productId}-${c.customerId}-${c.orderId ?? c.orderNo ?? ""}`,
             productId: p.productId,
             customerId: c.customerId,
             orderId: c.orderId || null,
             orderNo: c.orderNo || `${p.code}/${c.code}`,
-            productCode: p.code,
+            // Product Code column shows Oracle's exact ORDERITEMCODE
+            // (from FULLITEMKEYDECODER) when we have it on record, falling
+            // back to our internal Code only if Oracle never had one.
+            productCode: p.orderItemCode || p.code,
             productName: p.name,
+            uom,
             sortNo: p.sortNo ?? sortNoFallback({ Code: p.code }),
             shadeNo: shadeNoFor({ ShadeNo: p.shadeNo }, p.productId),
             category: subType,
@@ -403,7 +356,12 @@ export default function Batches() {
             customerName: c.name,
             customerCode: c.code,
             district: c.district || "",
+            state: c.state || "",
             taluk: c.taluk || "",
+            // "<number> <name>" built by the backend; number/name also kept separately.
+            deliveryPoint: c.deliveryPoint || "",
+            deliveryPointNo: c.deliveryPointNo || "",
+            deliveryPointName: c.deliveryPointName || "",
             officerName: c.officerName || "",
             requested: c.orderedQty,
             inquiryDate: c.inquiryDate || null,
@@ -413,33 +371,32 @@ export default function Batches() {
             price: p.price || 0,
             warehouse: warehouseFor(subType),
             allocationId: c.allocationId || null,
-            status: c.status || null, // pending | approved | rejected | null (not submitted)
+            status: c.status || null,
             remarks: c.remarks || "",
+            meters: c.meters || "",
+            savedMtrTotal: Number(c.totalMtr) || 0,
+            erpSentCases: Number(c.erpSentCases) || 0,
+            erpSentMtr: Number(c.erpSentMtr) || 0,
+            cdFlag: c.cdFlag ? "Yes" : "No",
+            priceListCode: c.priceListCode || "",
             erpStatus: c.erpStatus || "not_transferred",
             decidedAt: c.decidedAt || null,
             erpTransferredAt: c.erpTransferredAt || null,
+            firstAllocatedAt: c.firstAllocatedAt || null,
           });
         });
       });
       setRows(flat);
     } catch (err) {
+      if (reqId !== boardReqRef.current) return;
       setError(err.response?.data?.message || "Failed to load Marketing Review data.");
     } finally {
-      setLoading(false);
+      if (reqId === boardReqRef.current) setLoading(false);
     }
   };
 
-  // Region = real taluks, aggregated across every district. Sales Officer
-  // = real End Users ("Field Officers") — both power the filter dropdowns.
-  // One call each now (no more looping districts one at a time to build
-  // up the combined taluk list).
+  // Sales Officer = real End Users. (State / District come from the built-in India list.)
   const loadFilters = async () => {
-    try {
-      const talukRes = await API.get("/locations/taluks/all");
-      setRegionOptions(talukRes.data || []);
-    } catch {
-      setRegionOptions([]);
-    }
     try {
       const empRes = await API.get("/employees", { params: { role: "end_user" } });
       const employees = empRes.data?.data || empRes.data || [];
@@ -447,73 +404,130 @@ export default function Batches() {
     } catch {
       setOfficerOptions([]);
     }
+    try {
+      const priceRes = await API.get("/allocations/price-list-options");
+      if (Array.isArray(priceRes.data) && priceRes.data.length) setPriceCodeOptions(priceRes.data);
+    } catch {
+      // keep the TLODOM/DOMESTIC fallback already in state
+    }
   };
 
   useEffect(() => { loadBoard(); loadFilters(); }, []);
-  useEffect(() => { setSelectedRows(new Set()); }, [customerSearch, productSearch, inquiryDate, activeCat, viewBy, globalSearch, regionFilter, officerFilter, allocStatusFilter]);
+  useEffect(() => { setSelectedRows(new Set()); }, [customerSearch, enquiryNoSearch, productSearch, inquiryDate, viewBy, globalSearch, stateFilter, districtFilter, officerFilter, allocStatusFilter, uomStatusFilter]);
 
-  // Restore any local draft (qty/remarks not yet Saved & Submitted).
   useEffect(() => {
+    const refresh = () => loadBoard();
+    const onStorage = (e) => { if (e.key === "premier_mr_dirty") refresh(); };
+    window.addEventListener("premier-allocation-updated", refresh);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("premier-allocation-updated", refresh);
+      window.removeEventListener("storage", onStorage);
+    };
+    // eslint-disable-next-line
+  }, []);
+
+  // Open the balance row of the order(s) Order List sent us to. Runs once,
+  // as soon as the board rows have loaded.
+  const focusOpenedRef = useRef(false);
+  useEffect(() => {
+    if (focusOpenedRef.current || focusIds.length === 0 || rows.length === 0) return;
+    focusOpenedRef.current = true;
+    const open = {};
+    rows.forEach((r) => {
+      if (r.orderId && focusIds.includes(String(r.orderId)) && isPartialRow(r)) open[r.key] = true;
+    });
+    setExpandedPartials((m) => ({ ...m, ...open }));
+    // eslint-disable-next-line
+  }, [rows]);
+
+  // System Admin only reviews lines Admin has actually submitted with qty.
+  const boardRows = useMemo(() => {
+    if (!isSystemAdminRole) return rows;
+    return rows.filter((r) => r.allocationId && r.savedAllocated > 0);
+  }, [rows, isSystemAdminRole]);
+
+  const draftRestoredRef = useRef(false);
+  useEffect(() => {
+    if (draftRestoredRef.current || rows.length === 0) return;
+    draftRestoredRef.current = true;
     try {
       const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
       if (raw) {
         const draft = JSON.parse(raw);
-        if (draft.allocInputs) setAllocInputs(draft.allocInputs);
-        if (draft.remarksInputs) setRemarksInputs(draft.remarksInputs);
+        const liveKeys = new Set(rows.map((r) => r.key));
+        const keepLive = (obj) =>
+          Object.fromEntries(Object.entries(obj || {}).filter(([k]) => liveKeys.has(k)));
+        if (draft.allocInputs) setAllocInputs(keepLive(draft.allocInputs));
+        if (draft.remarksInputs) setRemarksInputs(keepLive(draft.remarksInputs));
+        if (draft.meterInputs) setMeterInputs(keepLive(draft.meterInputs));
+        if (draft.cdFlagInputs) setCdFlagInputs(keepLive(draft.cdFlagInputs));
+        if (draft.priceCodeInputs) setPriceCodeInputs(keepLive(draft.priceCodeInputs));
       }
     } catch {
       // ignore malformed/missing draft
     }
-  }, []);
+  }, [rows]);
 
   // ---- Allocation input helpers ------------------------------------------
-  // allocFor(row): what the EDITABLE INPUT BOX shows.
-  //
-  // Only ADMIN's box treats an already-fully-transferred base as "locked
-  // in" and starts a fresh increment at 0 — Admin is the one creating new
-  // allocations on top of it (see the carry-over-fix note at the top of
-  // this file). System Admin never allocates new stock here — they only
-  // Approve/Reject/Remark/Transfer — so their box (and every read that
-  // depends on it) must always show the REAL, already-submitted total.
-  // Resetting it to 0 for System Admin was a bug: a row would show "802
-  // total, 0 allocated" in their view even though 802 was genuinely
-  // sitting there waiting on their decision.
-  //
-  // NEW: the increment-starts-at-0 behavior only kicks in when the row is
-  // BOTH at ERP AND still short of its requested qty. A row that's
-  // already fully allocated (savedAllocated >= requested) has nothing
-  // left to add — showing 0 there was the bug reported: it made a row
-  // tagged "Fully Allocated" look like nothing had been allocated. Such a
-  // row now renders as a plain view-only value in AllocationRow below
-  // (see isFullyAllocated), so this only matters for rows that still have
-  // outstanding qty.
   const allocFor = (row) => {
     if (row.key in allocInputs) return allocInputs[row.key];
     if (isSystemAdminRole) return row.savedAllocated;
-    const hasOutstanding = row.savedAllocated < row.requested;
-    return row.erpStatus === "erp_so_created" && hasOutstanding ? 0 : row.savedAllocated;
+    return 0;
   };
-
-  // totalAllocFor(row): the REAL cumulative allocated qty for this row —
-  // base (already-transferred) + whatever fresh increment sits in Admin's
-  // box right now. Every calculation OTHER than Admin's input box itself
-  // (available stock, pending qty, value, status badge, the payload sent
-  // to the server) must use this, not allocFor().
   const totalAllocFor = (row) => {
     const boxValue = allocFor(row);
-    if (isSystemAdminRole) return boxValue; // already the real total for this role
-    const hasOutstanding = row.savedAllocated < row.requested;
-    return row.erpStatus === "erp_so_created" && hasOutstanding ? row.savedAllocated + boxValue : boxValue;
+    if (isSystemAdminRole) return boxValue;
+    return row.savedAllocated + boxValue;
   };
-
   const remarksFor = (row) => (row.key in remarksInputs ? remarksInputs[row.key] : (row.remarks || ""));
 
-  // Returns just the single MOST RECENT entry from a list, instead of the
-  // whole list — the alert popup shows one line per category (the latest
-  // update), not a running history of every order that ever qualified.
-  // Sorts by dateField (e.g. decidedAt / erpTransferredAt) when present;
-  // falls back to the last item in the list (most recently appended) when
-  // no timestamp is available on these entries.
+  // A partial order that is locked for Admin (already submitted, not rejected).
+  // Its ORDER row is read-only; only the balance row below it takes new input.
+  const isLockedPartial = (row) =>
+    !isSystemAdminRole
+    && !!row.allocationId
+    && isPartialRow(row)
+    && row.status !== "rejected";
+
+  // Mtr for the row's editable box (the balance row for a locked partial
+  // order). The balance row starts EMPTY, like a new row, and does not copy
+  // the parent's saved Mtr.
+  const meterFor = (row) => {
+    if (row.key in meterInputs) return meterInputs[row.key];
+    if (!isSystemAdminRole && row.savedAllocated === 0) return "";
+    if (isLockedPartial(row)) return "";
+    return row.meters || "";
+  };
+  // Mtr to SHOW for the order itself (totals, export, print): a locked
+  // partial order keeps showing its own saved Mtr.
+  const displayMeterFor = (row) => (isLockedPartial(row) ? (row.meters || "") : meterFor(row));
+  // Mtr to SEND on Approval: what was typed, otherwise keep the saved Mtr so
+  // it is never blanked out by an increment that has no Mtr of its own.
+  const meterToSend = (row) => meterFor(row) || row.meters || "";
+
+  // System Admin only: cases of this line already sent to ERP, while a top-up
+  // is waiting for approval. Those are hidden so only the NEW balance shows.
+  const sentCasesOf = (row) =>
+    isSystemAdminRole && row.erpStatus !== "erp_so_created" && row.erpSentCases > 0 && row.savedAllocated > row.erpSentCases
+      ? row.erpSentCases : 0;
+  const shownAllocFor = (row) => totalAllocFor(row) - sentCasesOf(row);
+
+  // TOTAL MTR for one order = Allocated Qty × Allocated Mtr.
+  // A locked partial order keeps its saved qty × saved Mtr, plus whatever is
+  // currently typed in its balance row (new qty × new Mtr).
+  // Saved total (from the server) + whatever is typed now (new qty × new Mtr).
+  const rowMtrTotal = (row) => {
+    const savedTotal = row.savedMtrTotal > 0 ? row.savedMtrTotal : row.savedAllocated * mtrNum(row.meters);
+    const typedExtra = isSystemAdminRole ? 0 : (Number(allocFor(row)) || 0) * mtrNum(meterFor(row));
+    const alreadySent = sentCasesOf(row) > 0 ? row.erpSentMtr : 0;
+    return savedTotal + typedExtra - alreadySent;
+  };
+
+  const cdFlagFor = (row) => cdFlagInputs[row.key] ?? row.cdFlag ?? "No";
+  const priceCodeFor = (row) =>
+    priceCodeInputs[row.key] ?? (row.priceListCode || DEFAULT_PRICE_CODE);
+
   const mostRecentOne = (list, dateField) => {
     if (list.length === 0) return [];
     if (dateField) {
@@ -529,43 +543,72 @@ export default function Batches() {
       if (!map.has(r.productId)) map.set(r.productId, r.poolAvailable);
     });
     rows.forEach((r) => {
-      // Compare against the REAL total (base + increment), not just the
-      // box value, so an already-transferred base doesn't get double
-      // subtracted from — or wrongly credited back to — the live pool.
-      const delta = totalAllocFor(r) - r.savedAllocated;
+      const meterRaw = parseFloat(String(meterFor(r)).replace(/[^\d.]/g, ""));
+      const meterMult = !isNaN(meterRaw) && meterRaw > 0 ? meterRaw : 0;
+      const delta = (totalAllocFor(r) - r.savedAllocated) * meterMult;
       if (delta !== 0) map.set(r.productId, map.get(r.productId) - delta);
     });
     return map;
-  }, [rows, allocInputs]);
+  }, [rows, allocInputs, meterInputs]);
 
   const setAlloc = (row, val) => {
     const liveAvailable = liveAvailableByProduct.get(row.productId) ?? row.poolAvailable;
     const currentBoxVal = allocFor(row);
-    // Stock cap: how much more can be added on top of what's already
-    // "spent" by this row's current box value.
-    const cap = liveAvailable + currentBoxVal;
-    // Requested cap: for Admin, once the base is locked in (already at
-    // ERP) AND there's still outstanding qty, the box represents a fresh
-    // increment and can only cover what's still outstanding against the
-    // order — not the full requested qty again. System Admin's box
-    // always represents the full total (see allocFor), so it's capped at
-    // the full requested qty.
-    const hasOutstanding = row.savedAllocated < row.requested;
-    const requestedCap = (!isSystemAdminRole && row.erpStatus === "erp_so_created" && hasOutstanding)
-      ? Math.max(0, row.requested - row.savedAllocated)
-      : row.requested;
+    const meterMult = numOr1(meterFor(row));
+    const cap = Math.floor((liveAvailable + currentBoxVal * meterMult) / meterMult);
+    const requestedCap = isSystemAdminRole
+      ? row.requested
+      : Math.max(0, row.requested - row.savedAllocated);
     const clamped = Math.max(0, Math.min(Number(val) || 0, cap, requestedCap));
     setAllocInputs((s) => ({ ...s, [row.key]: clamped }));
+    // No qty → no Mtr (Mtr can only be entered once a qty is entered).
+    if (clamped === 0) setMeterInputs((s) => ({ ...s, [row.key]: "" }));
   };
   const autoAllocateRow = (row) => {
     const liveAvailable = liveAvailableByProduct.get(row.productId) ?? row.poolAvailable;
     const currentBoxVal = allocFor(row);
-    const cap = liveAvailable + currentBoxVal;
-    const hasOutstanding = row.savedAllocated < row.requested;
-    const requestedCap = (!isSystemAdminRole && row.erpStatus === "erp_so_created" && hasOutstanding)
-      ? Math.max(0, row.requested - row.savedAllocated)
-      : row.requested;
+    const meterMult = numOr1(meterFor(row));
+    const cap = Math.floor((liveAvailable + currentBoxVal * meterMult) / meterMult);
+    const requestedCap = isSystemAdminRole
+      ? row.requested
+      : Math.max(0, row.requested - row.savedAllocated);
     setAlloc(row, Math.min(requestedCap, cap));
+  };
+
+  // Mtr is capped so (Allocated Qty × Mtr) never goes above the stock left.
+  // If the typed Mtr is too big, it snaps to the maximum allowed instead of
+  // letting Available Stock go negative.
+  const setMeter = (row, text) => {
+    const raw = String(text);
+    const typed = parseFloat(raw.replace(/[^\d.]/g, ""));
+
+    // Empty / non-numeric (e.g. clearing the box, or just "M") → no cap needed.
+    if (isNaN(typed) || typed <= 0) {
+      setMeterInputs((s) => ({ ...s, [row.key]: raw }));
+      return;
+    }
+
+    const qty = Number(allocFor(row)) || 0;
+    if (qty <= 0) return; // Mtr needs a qty first (the input already alerts about this)
+
+    // Stock left, with THIS row's own current usage added back.
+    const liveAvailable = liveAvailableByProduct.get(row.productId) ?? row.poolAvailable;
+    const ownMeter = parseFloat(String(meterFor(row)).replace(/[^\d.]/g, ""));
+    const ownUse = qty * (!isNaN(ownMeter) && ownMeter > 0 ? ownMeter : 0);
+    const maxMeter = Math.floor((liveAvailable + ownUse) / qty);
+
+    if (typed > maxMeter) {
+      if (maxMeter <= 0) {
+        setMeterInputs((s) => ({ ...s, [row.key]: "" }));
+        window.alert("No stock left to allocate Mtr for this product.");
+        return;
+      }
+      const suffix = raw.replace(/[\d.\s]/g, ""); // keep a typed "M" etc.
+      setMeterInputs((s) => ({ ...s, [row.key]: `${maxMeter}${suffix}` }));
+      return;
+    }
+
+    setMeterInputs((s) => ({ ...s, [row.key]: raw }));
   };
 
   // ---- Final Approval actions (System Admin) -----------------------------
@@ -581,6 +624,7 @@ export default function Batches() {
       await API.patch(`/allocations/${row.allocationId}/decision`, { status: decision });
       patchRowLocally(row.allocationId, { status: decision, decidedAt: new Date().toISOString() });
       setOk(decision === "approved" ? "Row approved." : "Row rejected.");
+      loadStockSummary();
     } catch (err) {
       setError(err.response?.data?.message || "Failed to save the decision.");
     } finally {
@@ -590,7 +634,7 @@ export default function Batches() {
   const saveRemarks = async (row) => {
     if (!row.allocationId) return;
     const text = remarksFor(row);
-    if (text === (row.remarks || "")) return; // nothing changed
+    if (text === (row.remarks || "")) return;
     try {
       await API.patch(`/allocations/${row.allocationId}/decision`, { remarks: text });
       patchRowLocally(row.allocationId, { remarks: text });
@@ -629,91 +673,139 @@ export default function Batches() {
       eligibleRows.forEach((r) => patchRowLocally(r.allocationId, { status: decision, decidedAt: new Date().toISOString() }));
       setOk(`${eligibleRows.length} row(s) ${decision}.`);
       setSelectedRows(new Set());
+      loadStockSummary();
     } catch (err) {
       setError(err.response?.data?.message || "Failed to apply the bulk decision.");
     }
   };
 
-  // ---- Filtering / sorting ------------------------------------------------
-  const catCounts = useMemo(() => {
-    const m = { all: rows.length };
-    CATEGORY_GROUPS.forEach((g) => { m[g.id] = 0; });
-    rows.forEach((r) => { m[r.group.id] = (m[r.group.id] || 0) + 1; });
-    return m;
-  }, [rows]);
+  // Expired (48h) partial orders are hidden from the normal list, but when an
+  // Enquiry Date is picked they are shown again, so an old order can still be
+  // looked up by its date (e.g. ordered 1 Oct, viewed on 4 Oct -> pick 1 Oct).
+  const activeRows = useMemo(() => {
+    const live = boardRows.filter((r) => inquiryDate || !isExpiredPartial(r));
+    if (!isSystemAdminRole) {
+      return live.filter((r) => !(r.allocationId && r.savedAllocated >= r.requested));
+    }
+    return live.filter((r) => r.erpStatus !== "erp_so_created");
+  }, [boardRows, isSystemAdminRole, inquiryDate]);
 
-  // Priority bucket for a single row — 0 sorts before 1, i.e. shows up
-  // FIRST in the table. See the "PENDING / PARTIALLY ALLOCATED FIRST"
-  // note at the top of this file.
-  //   - System Admin: anything not yet submitted or still Pending, OR
-  //     still short of its requested qty (allocated < requested), is
-  //     urgent (0). Fully-decided AND fully-allocated rows sink to the
-  //     bottom (1).
-  //   - Admin: Not Allocated / Stock Shortage / Partial Allocated (i.e.
-  //     allocated < requested) is urgent (0); Fully Allocated sinks (1).
-  // Uses totalAllocFor() so in-progress (unsaved) edits are reflected
-  // immediately, same as the status badges and alert strip do.
+  const enquiryNoOptions = useMemo(
+    () => Array.from(new Set(boardRows.map((r) => r.orderNo).filter(Boolean))),
+    [boardRows]
+  );
+  const customerNameOptions = useMemo(
+    () => Array.from(new Set(boardRows.map((r) => r.customerName).filter(Boolean))),
+    [boardRows]
+  );
+
+  // Suggestions for the big search bar: product, customer, order no, sort no, shade.
+  const globalSearchOptions = useMemo(() => {
+    const set = new Set();
+    boardRows.forEach((r) => {
+      [r.productName, r.productCode, r.customerName, r.customerCode, r.orderNo, r.sortNo, r.shadeNo]
+        .forEach((v) => { if (v !== null && v !== undefined && String(v).trim() && v !== "—") set.add(String(v)); });
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [boardRows]);
+
+  const UOM_FILTER_FALLBACK = ["Box", "Pieces", "Meter"];
+  const uomOptions = useMemo(() => {
+    const fromData = boardRows.map((r) => r.uom).filter(Boolean);
+    const merged = Array.from(new Set([...fromData, ...UOM_FILTER_FALLBACK])).sort();
+    return merged.map((u) => ({ value: u, label: UOM_LABEL_OVERRIDES[u] || u }));
+  }, [boardRows]);
+
+  // Priority: -1 = partial order inside its 48h window (goes to the very top),
+  // 0 = still needs attention, 1 = everything else.
   const rowPriority = (r) => {
-    const allocated = totalAllocFor(r);
+    if (isPartialRow(r)) return -1;
     if (isSystemAdminRole) {
       if (!r.allocationId || r.status === "pending") return 0;
-      if (allocated < r.requested) return 0;
+      if (r.savedAllocated < r.requested) return 0;
       return 1;
     }
-    return allocated < r.requested ? 0 : 1;
+    return r.savedAllocated < r.requested ? 0 : 1;
   };
 
-  const visibleRows = useMemo(() => {
-    let list = rows;
-    if (activeCat !== "all") list = list.filter((r) => r.group.id === activeCat);
+  // Every filter EXCEPT the category pill. The pill counts are taken from this
+  // list, so they follow Enquiry Date / No / Customer / State / District /
+  // Sales Officer / search / status filters.
+  const filteredNoCat = useMemo(() => {
+    let list = activeRows;
+    // Coming from Order List "Allocated": show only that order's line(s).
+    if (focusIds.length) list = list.filter((r) => focusIds.includes(String(r.orderId)));
     if (globalSearch.trim()) {
       const q = globalSearch.trim().toLowerCase();
       list = list.filter((r) =>
         r.productName.toLowerCase().includes(q) || r.productCode.toLowerCase().includes(q) ||
         r.customerName.toLowerCase().includes(q) || r.customerCode.toLowerCase().includes(q) ||
-        (r.orderNo || "").toLowerCase().includes(q));
+        (r.orderNo || "").toLowerCase().includes(q) ||
+        String(r.sortNo ?? "").toLowerCase().includes(q) ||
+        String(r.shadeNo ?? "").toLowerCase().includes(q));
     }
     if (customerSearch.trim()) {
       const q = customerSearch.trim().toLowerCase();
       list = list.filter((r) => r.customerName.toLowerCase().includes(q) || r.customerCode.toLowerCase().includes(q));
     }
+    if (enquiryNoSearch.trim()) {
+      const q = enquiryNoSearch.trim().toLowerCase();
+      list = list.filter((r) => (r.orderNo || "").toLowerCase().includes(q));
+    }
     if (productSearch.trim()) {
       const q = productSearch.trim().toLowerCase();
       list = list.filter((r) => r.productName.toLowerCase().includes(q) || r.productCode.toLowerCase().includes(q));
     }
-    if (inquiryDate) {
-      list = list.filter((r) => r.inquiryDate === inquiryDate);
+    if (inquiryDate) list = list.filter((r) => r.inquiryDate === inquiryDate);
+    if (stateFilter) list = list.filter((r) => (r.state ? sameName(r.state, stateFilter) : stateOfDistrict(r.district) === stateFilter));
+    if (districtFilter) {
+      const dq = districtFilter.toLowerCase().replace(/[^a-z]/g, "");
+      list = list.filter((r) => {
+        const rd = String(r.district || "").toLowerCase().replace(/[^a-z]/g, "");
+        return rd && (rd === dq || rd.includes(dq));
+      });
     }
-    if (regionFilter) {
-      list = list.filter((r) => r.taluk === regionFilter);
-    }
-    if (officerFilter) {
-      list = list.filter((r) => r.officerName === officerFilter);
-    }
+    if (officerFilter) list = list.filter((r) => r.officerName === officerFilter);
     if (allocStatusFilter) {
-      list = list.filter((r) => (r.status || "").toLowerCase() === allocStatusFilter);
+      list = list.filter((r) => {
+        if (isSystemAdminRole) return approvalStatusKey(r) === allocStatusFilter;
+        const available = liveAvailableByProduct.get(r.productId) ?? r.poolAvailable;
+        return stockStatusKey(r, available, totalAllocFor(r)) === allocStatusFilter;
+      });
     }
-    const sorted = [...list];
+    if (uomStatusFilter) list = list.filter((r) => r.uom === uomStatusFilter);
+    return list;
+  }, [activeRows, globalSearch, customerSearch, productSearch, inquiryDate, stateFilter, districtFilter, officerFilter, allocStatusFilter, uomStatusFilter, enquiryNoSearch, allocInputs, liveAvailableByProduct, focusIds]);
+
+  // Pill counts = order lines left after the filters above, per category.
+  const catCounts = useMemo(() => {
+    const m = { all: filteredNoCat.length };
+    CATEGORY_GROUPS.forEach((g) => { m[g.id] = 0; });
+    filteredNoCat.forEach((r) => { m[r.group.id] = (m[r.group.id] || 0) + 1; });
+    return m;
+  }, [filteredNoCat, CATEGORY_GROUPS]);
+
+  const visibleRows = useMemo(() => {
+    const sorted = activeCat === "all" ? [...filteredNoCat] : filteredNoCat.filter((r) => r.group.id === activeCat);
     sorted.sort((a, b) => {
       const pa = rowPriority(a), pb = rowPriority(b);
-      if (pa !== pb) return pa - pb; // Pending / Partial first
+      if (pa !== pb) return pa - pb;
+      // Among partial orders: most recently allocated first.
+      if (pa === -1) {
+        const ha = hoursSince(a.firstAllocatedAt) ?? Infinity;
+        const hb = hoursSince(b.firstAllocatedAt) ?? Infinity;
+        if (ha !== hb) return ha - hb;
+      }
       return viewBy === "customer"
         ? (a.customerName.localeCompare(b.customerName) || a.productCode.localeCompare(b.productCode))
         : (a.productCode.localeCompare(b.productCode) || a.customerName.localeCompare(b.customerName));
     });
     return sorted;
-  }, [rows, activeCat, globalSearch, customerSearch, productSearch, inquiryDate, regionFilter, officerFilter, allocStatusFilter, viewBy, allocInputs]);
-
+  }, [filteredNoCat, activeCat, viewBy]);
   const allRowsSelected = visibleRows.length > 0 && visibleRows.every((r) => selectedRows.has(r.key));
   const selectedEligibleForDecision = visibleRows.filter((r) => selectedRows.has(r.key) && r.status === "pending" && r.allocationId);
 
-  // ---- Partial-allocation alerts ------------------------------------
-  // Every visible order that has *some* stock allocated but not all of
-  // it (i.e. strictly between "Not Allocated" and "Fully Allocated")
-  // shows up here — product, order no, customer and the exact remaining
-  // qty still owed to that order. Uses totalAllocFor() so it reflects
-  // in-progress edits AND an already-transferred base, not just what's
-  // sitting in the input box.
+  // ---- Alerts ------------------------------------------------------------
   const partialAlerts = useMemo(() => {
     return visibleRows
       .map((r) => ({ r, allocated: totalAllocFor(r) }))
@@ -727,35 +819,15 @@ export default function Batches() {
       }));
   }, [visibleRows, allocInputs]);
 
-  // ---- Approved / Rejected / ERP SO Created alerts (System Admin) ----
-  // Same "grouped into the popup" pattern as partialAlerts above, scoped
-  // to the currently visible (filtered/searched) rows — gives System
-  // Admin a running summary of what they've already decided without
-  // having to scroll the full table looking for it.
-  const approvedAlerts = useMemo(
-    () => visibleRows.filter((r) => r.status === "approved"),
-    [visibleRows]
-  );
-  const rejectedAlerts = useMemo(
-    () => visibleRows.filter((r) => r.status === "rejected"),
-    [visibleRows]
-  );
-  const erpCreatedAlerts = useMemo(
-    () => visibleRows.filter((r) => r.erpStatus === "erp_so_created"),
-    [visibleRows]
-  );
+  const approvedAlerts = useMemo(() => visibleRows.filter((r) => r.status === "approved"), [visibleRows]);
+  const rejectedAlerts = useMemo(() => visibleRows.filter((r) => r.status === "rejected"), [visibleRows]);
+  const erpCreatedAlerts = useMemo(() => visibleRows.filter((r) => r.erpStatus === "erp_so_created"), [visibleRows]);
 
-  // ---- Admin's remarks alert ------------------------------------------
-  // Admin's own table has no Remarks column (that's System-Admin-only),
-  // so anything System Admin wrote back on a row Admin allocated stock to
-  // would otherwise be invisible to Admin entirely. Surfaces any visible
-  // row Admin has put stock against that also carries a remark.
   const adminRemarksAlerts = useMemo(() => {
     if (isSystemAdminRole) return [];
     return visibleRows.filter((r) => totalAllocFor(r) > 0 && (r.remarks || "").trim());
   }, [visibleRows, isSystemAdminRole, allocInputs]);
 
-  // Auto-open the popup once (per board load) if there's anything to show.
   useEffect(() => {
     if (loading) return;
     const hasAlerts = isSystemAdminRole
@@ -774,6 +846,7 @@ export default function Batches() {
           productId: r.productId,
           productCode: r.productCode,
           productName: r.productName,
+          uom: r.uom,
           sortNo: r.sortNo,
           shadeNo: r.shadeNo,
           category: r.category,
@@ -782,63 +855,39 @@ export default function Batches() {
           requestedSum: 0,
           allocatedSum: 0,
           valueSum: 0,
+          mtrSum: 0, // Σ (Allocated Qty × Allocated Mtr) for this product
           rows: [],
         });
       }
       const entry = map.get(r.productId);
-      const allocated = totalAllocFor(r);
+      const allocated = shownAllocFor(r);
       entry.requestedSum += r.requested;
       entry.allocatedSum += allocated;
       entry.valueSum += allocated * r.price;
+      entry.mtrSum += rowMtrTotal(r);
       entry.rows.push(r);
     });
-    // Pending / partially-allocated products first — see the
-    // "PENDING / PARTIALLY ALLOCATED FIRST" note at the top of this file.
-    // A product is "urgent" (0) if ANY of its rows are still urgent, so a
-    // product with even one unresolved order stays near the top.
     const groups = Array.from(map.values());
     groups.sort((a, b) => {
-      const pa = a.rows.some((r) => rowPriority(r) === 0) ? 0 : 1;
-      const pb = b.rows.some((r) => rowPriority(r) === 0) ? 0 : 1;
+      const pa = Math.min(...a.rows.map(rowPriority));
+      const pb = Math.min(...b.rows.map(rowPriority));
       if (pa !== pb) return pa - pb;
       return a.productCode.localeCompare(b.productCode);
     });
     return groups;
-  }, [visibleRows, liveAvailableByProduct, allocInputs]);
+  }, [visibleRows, liveAvailableByProduct, allocInputs, meterInputs]);
 
   const toggleProductExpanded = (productId) =>
     setExpandedProducts((s) => ({ ...s, [productId]: !s[productId] }));
 
-  // Same read as stockStatus()/groupStockStatus() above, but rolled up
-  // across every customer on that product — a single badge when they all
-  // agree, otherwise a "Mixed" badge with a small breakdown underneath.
-  // System Admin's read: the real, server-persisted approval state.
-  const approvalStatus = (row) => {
-    if (!row.allocationId) return { label: "Not Submitted", cls: "tag-neutral" };
-    if (row.status === "approved") return { label: "Approved", cls: "tag-approved" };
-    if (row.status === "rejected") return { label: "Rejected", cls: "tag-hold" };
-    return { label: "Pending", cls: "tag-pending" };
-  };
+  const approvalStatus = (row) => APPROVAL_STATUS_META[approvalStatusKey(row)];
   const groupApprovalStatus = (g) => {
-    const labels = g.rows.map((r) => approvalStatus(r).label);
-    const unique = Array.from(new Set(labels));
-    if (unique.length === 1) {
-      const only = g.rows[0] ? approvalStatus(g.rows[0]) : { label: unique[0], cls: "tag-neutral" };
-      return only;
-    }
-    const counts = {};
-    labels.forEach((l) => { counts[l] = (counts[l] || 0) + 1; });
-    return { label: "Mixed", cls: "tag-pending", detail: Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(" · ") };
+    const keys = g.rows.map((r) => approvalStatusKey(r));
+    if (keys.some((k) => k === "pending" || k === "not_submitted")) return APPROVAL_STATUS_META.pending;
+    if (keys.some((k) => k === "approved")) return APPROVAL_STATUS_META.approved;
+    return APPROVAL_STATUS_META.rejected;
   };
-  // ERP SO Status rolled up across the whole product.
-  //   - "Not Transferred": nothing submitted, or none of the submitted
-  //     rows are Approved yet (still with System Admin or rejected).
-  //   - "Ready for ERP": every submitted row is Approved but none have
-  //     been pushed to ERP yet — the tick alone doesn't create the SO,
-  //     it just makes the row eligible; "Transfer to ERP" is the actual
-  //     handoff.
-  //   - "Partially Ready" / "Partially Transferred": a mix.
-  //   - "ERP SO Created": every submitted row has been transferred.
+
   const groupErpStatus = (g) => {
     const submitted = g.rows.filter((r) => r.allocationId);
     if (submitted.length === 0) return { label: "Not Transferred", cls: "tag-neutral" };
@@ -854,14 +903,16 @@ export default function Batches() {
     return { label: "Not Transferred", cls: "tag-neutral" };
   };
 
+  // Footer / summary totals, including the grand total of Allocated Mtr.
   const totals = visibleRows.reduce((a, r) => {
-    const allocated = totalAllocFor(r);
+    const allocated = shownAllocFor(r);
     return {
       requested: a.requested + r.requested,
       allocated: a.allocated + allocated,
       value: a.value + allocated * r.price,
+      mtr: a.mtr + rowMtrTotal(r),
     };
-  }, { requested: 0, allocated: 0, value: 0 });
+  }, { requested: 0, allocated: 0, value: 0, mtr: 0 });
 
   const distinctCustomers = new Set(visibleRows.map((r) => r.customerCode)).size;
   const distinctProductsAvailable = useMemo(() => {
@@ -874,9 +925,7 @@ export default function Batches() {
   }, [visibleRows, liveAvailableByProduct]);
   const totalStockScope = Array.from(distinctProductsAvailable.values()).reduce((a, v) => a + v, 0);
 
-  // ---- System Admin's four headline stats (page-wide, not just the
-  // active tab) — Pending Final Approval / Approved Orders Today / Total
-  // Order Value / ERP Transfer Pending. -------------------------------
+  // ---- System Admin's four headline stats ----------------------------
   const pendingFinalApprovalCount = useMemo(() => rows.filter((r) => r.status === "pending").length, [rows]);
   const approvedTodayCount = useMemo(
     () => rows.filter((r) => r.status === "approved" && (r.decidedAt || "").slice(0, 10) === todayStr()).length,
@@ -888,71 +937,38 @@ export default function Batches() {
     [rows]
   );
 
-  // ---- Admin's four headline stats (page-wide, not just the active tab)
-  // — Today's Inquiries / Pending Allocation / Available Stock / Awaiting
-  // Approval. Distinct from System Admin's set above: these describe the
-  // allocation work still on Admin's own plate, not the final-approval /
-  // ERP-handoff work that belongs to System Admin.
-  //   - Today's Inquiries: every active Order line currently on this
-  //     board (the day's live demand Admin needs to work through).
-  //   - Pending Allocation: lines where the allocated qty hasn't yet
-  //     caught up to the requested qty (still needs stock assigned).
-  //   - Available Stock: total unallocated stock left across every
-  //     product currently on the board (the pool Admin is allocating
-  //     from), not scoped to the active category tab or search.
-  //   - Awaiting Approval: lines Admin has already submitted ("Approval")
-  //     that are still sitting with System Admin as Status = Pending —
-  //     same underlying figure as pendingFinalApprovalCount above, just
-  //     framed from Admin's side of the workflow.
+  // ---- Admin's four headline stats -----------------------------------
   const todayInquiriesCount = rows.length;
   const pendingAllocationCount = useMemo(
     () => rows.filter((r) => totalAllocFor(r) < r.requested).length,
     [rows, allocInputs]
   );
-  const totalAvailableStockAll = useMemo(() => {
-    const map = new Map();
-    rows.forEach((r) => {
-      if (!map.has(r.productId)) map.set(r.productId, liveAvailableByProduct.get(r.productId) ?? r.poolAvailable);
-    });
-    return Array.from(map.values()).reduce((a, v) => a + v, 0);
-  }, [rows, liveAvailableByProduct]);
+
+  const CAT_TO_STOCK_LABEL = {
+    dhoti: "Dhoti", blouse: "Blouse", uniform_shirting: "Uniform Shirting",
+    uniform_suiting: "Uniform Suiting", others: "Others", all: "all",
+  };
+  const [stockSummary, setStockSummary] = useState({});
+  const loadStockSummary = () => {
+    API.get("/products/available-stock-summary")
+      .then((res) => setStockSummary(res.data || {}))
+      .catch(() => { });
+  };
+  useEffect(() => { loadStockSummary(); }, []);
+  const totalAvailableStockAll = stockSummary[CAT_TO_STOCK_LABEL[activeCat] || "all"] || 0;
+
   const awaitingApprovalCount = pendingFinalApprovalCount;
 
   const goToSalesOrder = (view) => navigate(`/master/sales-order?view=${view}`);
 
   const activeCatLabel = activeCat === "all" ? null : CATEGORY_GROUPS.find((g) => g.id === activeCat)?.name;
   const showCatColumn = activeCat === "all";
-  const sysAdminCols = isSystemAdminRole ? 4 : 0; // customer-wise: checkbox + Actions + Remarks + ERP SO Status
-  const customerColCount = (showCatColumn ? 12 : 11) + sysAdminCols;
-  // Product Wise: S.No + 4 identity columns (Code/Sort No/Shade No/Name
-  // collapsed — OrderNo/CustomerName/CustomerCode/spacer when a product is
-  // expanded) + optional Category + 5 shared data columns (Requested/
-  // Available/Allocated/Value/Status) + (System Admin) Actions/Remarks/ERP
-  // SO Status + the select-all checkbox. Every row shape (collapsed
-  // totals, sub-header, detail) uses this same column count so they all
-  // line up.
-  const productColCount = (showSelection ? 1 : 0) + 1 + 4 + (showCatColumn ? 1 : 0) + 5 + (isSystemAdminRole ? 3 : 0);
+  const customerColCount = (isSystemAdminRole ? 19 : 17) + (showCatColumn ? 1 : 0);
+  const productColCount = (showSelection ? 1 : 0) + 1 + 1 + 4 + 1 + (showCatColumn ? 1 : 0) + 5 + 5 + (isSystemAdminRole ? 3 : 0);
+  const customerFooterSpan = (showCatColumn ? 6 : 5) + 6;
+  const productFooterSpan = (showCatColumn ? 6 : 5) + (showSelection ? 1 : 0) + 6;
 
   // ---- Save / Reset / Draft / Export --------------------------------------
-  //
-  // IMPORTANT: sends totalAllocFor(r) — the REAL cumulative total (locked
-  // base + new increment) — not allocFor(r) (which is just what's sitting
-  // in the box). Sending only the box value here is exactly what was
-  // causing the 700 to disappear: once the base was locked in at ERP, the
-  // box legitimately shows 0/100 for "new work", but the server's
-  // AllocatedQty field needs the full 800, not the box's 100.
-  //
-  // ── PER-ORDER PAYLOAD (fixed) ────────────────────────────────────────
-  // Each row is now sent as its OWN entry — orderId + customerId +
-  // allocatedQty — instead of the old "aggregate every row by customerId
-  // into one number" workaround. That workaround existed because the
-  // server used to track only one allocation record per (Product,
-  // Customer); it's what caused a customer's second Order for the same
-  // product to silently overwrite (or be overwritten by) the first one's
-  // qty/status. Now that product_allocations carries OrderId
-  // (AllocationController@store keys on (ProductId, OrderId)), every
-  // Order gets its own independent record, so each row can — and must —
-  // be sent separately.
   const handleSaveAll = async () => {
     setSaving(true); setError(""); setOk("");
     try {
@@ -961,48 +977,102 @@ export default function Batches() {
         if (!byProduct.has(r.productId)) byProduct.set(r.productId, []);
         byProduct.get(r.productId).push(r);
       });
+
+      const productErrors = [];
+      const submittedKeys = [];
+      let anySubmitted = false;
+
+      // Each product is an independent request, so send them all at once
+      // instead of waiting for one product to finish before the next.
+      const jobs = [];
       for (const [productId, productRows] of byProduct.entries()) {
-        await API.post("/allocations", {
-          productId,
-          allocations: productRows
-            .filter((r) => r.orderId) // every active row should carry an Order id
-            .map((r) => ({
+        const toSubmit = productRows.filter(
+          (r) => r.orderId && r.key in allocInputs && Number(allocInputs[r.key]) > 0
+        );
+        if (toSubmit.length === 0) continue;
+        jobs.push(
+          API.post("/allocations", {
+            productId,
+            allocations: toSubmit.map((r) => ({
               orderId: r.orderId,
               customerId: r.customerId,
               allocatedQty: totalAllocFor(r),
+              meters: meterToSend(r),
+              cdFlag: cdFlagFor(r) === "Yes" ? 1 : 0,
+              priceListCode: priceCodeFor(r) || null,
             })),
-        });
+          })
+            .then(() => {
+              anySubmitted = true;
+              toSubmit.forEach((r) => submittedKeys.push(r.key));
+            })
+            .catch((err) => {
+              const productName = productRows[0]?.productName || `Product ${productId}`;
+              const msg = err.response?.data?.message || "Failed to save.";
+              productErrors.push(`${productName}: ${msg}`);
+            })
+        );
       }
-      // Any remarks typed in (System Admin) that haven't been blurred yet.
+      await Promise.all(jobs);
+
       await Promise.all(
         rows.filter((r) => r.allocationId && remarksFor(r) !== (r.remarks || ""))
-          .map((r) => API.patch(`/allocations/${r.allocationId}/decision`, { remarks: remarksFor(r) }).catch(() => {}))
+          .map((r) => API.patch(`/allocations/${r.allocationId}/decision`, { remarks: remarksFor(r) }).catch(() => { }))
       );
-      // ERP transfer is a separate, deliberate step now — see
-      // handleTransferToErp(); Approval only saves qty/remarks and submits
-      // touched rows to System Admin.
-      setOk("Allocation saved & submitted for approval.");
-      setAllocInputs({});
-      setRemarksInputs({});
-      localStorage.removeItem(DRAFT_STORAGE_KEY);
-      await loadBoard();
+
+      if (anySubmitted) {
+        // Clear ONLY what was submitted — products that failed keep what the
+        // user typed so they can fix and retry.
+        const drop = (o) => Object.fromEntries(Object.entries(o).filter(([k]) => !submittedKeys.includes(k)));
+        setAllocInputs(drop);
+        setMeterInputs(drop);
+        setCdFlagInputs(drop);
+        setPriceCodeInputs(drop);
+        setRemarksInputs({});
+        if (productErrors.length === 0) localStorage.removeItem(DRAFT_STORAGE_KEY);
+        try { localStorage.setItem("premier_mr_dirty", Date.now().toString()); } catch { /* ignore */ }
+        // Refresh in the background — the button is released as soon as the
+        // save itself is done, not after the whole board has been reloaded.
+        loadBoard();
+        loadStockSummary();
+      }
+
+      if (productErrors.length > 0) {
+        setError((anySubmitted ? "Some products saved. Errors:\n" : "") + productErrors.join("\n"));
+      } else if (anySubmitted) {
+        setOk("Allocation saved & submitted for approval.");
+      } else {
+        setOk("Nothing new to submit — enter an allocated quantity first.");
+      }
+      // Make sure the message is actually seen.
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (err) {
       setError(err.response?.data?.message || "Failed to save allocation.");
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } finally {
       setSaving(false);
     }
   };
 
-  // System Admin only — pushes every already-Approved, not-yet-transferred
-  // row to ERP in one batch. Kept fully separate from Approval: approving
-  // a row (tick in Actions) never triggers this on its own any more.
   const handleTransferToErp = async () => {
     const readyForErp = rows.filter((r) => r.allocationId && r.status === "approved" && r.erpStatus !== "erp_so_created");
     if (readyForErp.length === 0) return;
     setTransferringErp(true); setError(""); setOk("");
     try {
-      await API.post("/allocations/bulk-erp-transfer", { ids: readyForErp.map((r) => r.allocationId) });
-      setOk(`${readyForErp.length} row(s) transferred to ERP.`);
+      const res = await API.post("/allocations/bulk-erp-transfer", { ids: readyForErp.map((r) => r.allocationId) });
+      const data = res.data || {};
+      const succeeded = data.updated || data.succeeded?.length || 0;
+      const failed = data.failed || [];
+      if (failed.length > 0 && succeeded === 0) {
+        // All failed — show error
+        const msgs = failed.map((f) => f.message || "Transfer failed").filter((v, i, a) => a.indexOf(v) === i);
+        setError(`ERP transfer failed for all ${failed.length} row(s): ${msgs.join("; ")}`);
+      } else if (failed.length > 0) {
+        // Partial success
+        setOk(`${succeeded} row(s) transferred to ERP. ${failed.length} row(s) failed — check Oracle connectivity.`);
+      } else {
+        setOk(`${succeeded || readyForErp.length} row(s) transferred to ERP.`);
+      }
       await loadBoard();
     } catch (err) {
       setError(err.response?.data?.message || "Failed to transfer to ERP.");
@@ -1011,12 +1081,9 @@ export default function Batches() {
     }
   };
 
-  // The bottom-left "Approval" button now does double duty for System
-  // Admin: if any rows are checkbox-selected (and at least one of them is
-  // actually Pending), it runs the same bulk-approve that used to live in
-  // its own "Approve Selected" toolbar. Otherwise it falls through to the
-  // normal handleSaveAll() flow (Admin's save-and-submit).
+
   const handleApprovalClick = () => {
+    if (saving) return;
     if (isSystemAdminRole && selectedEligibleForDecision.length > 0) {
       bulkDecide("approved", selectedEligibleForDecision);
       return;
@@ -1024,11 +1091,11 @@ export default function Batches() {
     handleSaveAll();
   };
 
-  const handleReset = () => { setAllocInputs({}); setRemarksInputs({}); };
+  const handleReset = () => { setAllocInputs({}); setRemarksInputs({}); setMeterInputs({}); setCdFlagInputs({}); setPriceCodeInputs({}); };
 
   const handleSaveDraft = () => {
     try {
-      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ allocInputs, remarksInputs }));
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ allocInputs, remarksInputs, meterInputs, cdFlagInputs, priceCodeInputs }));
       setOk("Draft saved on this device.");
     } catch {
       setError("Could not save draft (browser storage unavailable).");
@@ -1044,12 +1111,16 @@ export default function Batches() {
         "Order No": r.orderNo,
         "Customer Name": r.customerName,
         "Customer Code": r.customerCode,
+        "District": r.district,
+        "Delivery Point": r.deliveryPoint,
         "Product Code": r.productCode,
         "Product Description": r.productName,
+        "UOM": r.uom ? uomLabel(r.uom) : "",
         "Requested Qty": r.requested,
         "Available Stock": available,
         "Allocated Qty": allocated,
-        "Total Value": Number((allocated * r.price).toFixed(2)),
+        "Meter (M)": displayMeterFor(r),
+        "Total Mtr": round2(rowMtrTotal(r)),
         "Status": status,
       };
       if (isSystemAdminRole) {
@@ -1058,6 +1129,15 @@ export default function Batches() {
       }
       return row;
     });
+    // Grand total row at the bottom of the sheet.
+    if (data.length > 0) {
+      data.push({
+        "Order No": "TOTAL",
+        "Requested Qty": totals.requested,
+        "Allocated Qty": totals.allocated,
+        "Total Mtr": round2(totals.mtr),
+      });
+    }
     const sheet = XLSX.utils.json_to_sheet(data);
     const book = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(book, sheet, "Marketing Review");
@@ -1071,92 +1151,152 @@ export default function Batches() {
       const available = liveAvailableByProduct.get(r.productId) ?? r.poolAvailable;
       const allocated = totalAllocFor(r);
       const status = isSystemAdminRole ? approvalStatus(r).label : stockStatus(r, available, allocated).label;
-      return `<tr><td>${r.orderNo}</td><td>${r.customerName}</td><td>${r.customerCode}</td><td>${r.productCode}</td><td>${r.productName}</td><td style="text-align:right">${r.requested}</td><td style="text-align:right">${available}</td><td style="text-align:right">${allocated}</td><td style="text-align:right">${(allocated * r.price).toLocaleString()}</td><td>${status}</td></tr>`;
+      return `<tr><td>${r.orderNo}</td><td>${r.customerName}</td><td>${r.customerCode}</td><td>${r.productCode}</td><td>${r.productName}</td><td>${r.uom ? uomLabel(r.uom) : "—"}</td><td style="text-align:right">${r.requested}</td><td style="text-align:right">${available}</td><td style="text-align:right">${allocated}</td><td style="text-align:center">${displayMeterFor(r) || "—"}</td><td style="text-align:right">${fmtMtr(rowMtrTotal(r))}</td><td>${status}</td></tr>`;
     }).join("");
     win.document.write(`<html><head><title>Marketing Review Summary</title>
       <style>body{font-family:Arial,sans-serif;padding:24px;color:#0F2138}
       table{width:100%;border-collapse:collapse;font-size:12px}
       th,td{border:1px solid #DBE3EC;padding:6px 8px;text-align:left}
       th{background:#122C48;color:#fff}
+      tfoot td{font-weight:bold;background:#F1F5F9}
       h1{font-size:18px}</style></head><body>
       <h1>Marketing Review — Allocation Summary</h1>
-      <p>Total Requested: ${totals.requested} Pcs · Total Allocated: ${totals.allocated} Pcs · Total Value: ₹${totals.value.toLocaleString()}</p>
-      <table><thead><tr><th>Order No</th><th>Customer</th><th>Code</th><th>Product Code</th><th>Product</th><th>Requested</th><th>Available</th><th>Allocated</th><th>Value (₹)</th><th>Status</th></tr></thead>
-      <tbody>${rowsHtml}</tbody></table>
+      <p>Total Requested: ${totals.requested} Pcs · Total Allocated: ${totals.allocated} Pcs · Total Mtr: ${fmtMtr(totals.mtr)}</p>
+      <table><thead><tr><th>Order No</th><th>Customer</th><th>Code</th><th>Product Code</th><th>Product</th><th>UOM</th><th>Requested</th><th>Available</th><th>Allocated</th><th>Meter (M)</th><th>Total Mtr</th><th>Status</th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+      <tfoot><tr><td colspan="6" style="text-align:right">Total</td><td style="text-align:right">${totals.requested}</td><td></td><td style="text-align:right">${totals.allocated}</td><td></td><td style="text-align:right">${fmtMtr(totals.mtr)}</td><td></td></tr></tfoot></table>
       </body></html>`);
     win.document.close();
     win.focus();
     win.print();
   };
 
+  const statCardsSys = (
+    <>
+      <StatCardV2 icon={Hourglass} label="Pending Final Approval" value={pendingFinalApprovalCount} accent="#D69426"
+        onViewDetails={() => goToSalesOrder("pending_final_approval")} />
+      <StatCardV2 icon={ClipboardList} label="Approved Orders Today" value={approvedTodayCount} accent="#2E6B9E"
+        onViewDetails={() => goToSalesOrder("approved_today")} />
+      <StatCardV2 icon={PackageCheck} label="Total Order Value" value={`₹${totalOrderValue.toLocaleString()}`} accent="#2E7A72"
+        onViewDetails={() => goToSalesOrder("total_order_value")} />
+      <StatCardV2 icon={Truck} label="ERP Transfer Pending" value={erpTransferPendingCount} accent="#B23A3A"
+        onViewDetails={() => goToSalesOrder("erp_transfer_pending")} />
+    </>
+  );
+
+  const rowProps = (r, sNo) => ({
+    r, sNo,
+    available: liveAvailableByProduct.get(r.productId) ?? r.poolAvailable,
+    showCatColumn,
+    canManage,
+    inputValue: allocFor(r),
+    allocated: totalAllocFor(r),
+    shownQty: shownAllocFor(r),
+    onAlloc: (v) => setAlloc(r, v),
+    onAutoAllocate: () => autoAllocateRow(r),
+    meterValue: meterFor(r),
+    onMeterChange: (v) => setMeter(r, v),
+    cdFlagValue: cdFlagFor(r),
+    onCdFlagChange: (v) => setCdFlagInputs((s) => ({ ...s, [r.key]: v })),
+    priceCodeValue: priceCodeFor(r),
+    onPriceCodeChange: (v) => setPriceCodeInputs((s) => ({ ...s, [r.key]: v })),
+    priceCodeOptions: Array.from(new Set([DEFAULT_PRICE_CODE, ...priceCodeOptions])),
+    statusTag: isSystemAdminRole ? approvalStatus(r) : stockStatus(r, liveAvailableByProduct.get(r.productId) ?? r.poolAvailable, totalAllocFor(r)),
+    isSystemAdminRole,
+    busy: busyDecision.has(r.allocationId),
+    onApprove: () => decideRow(r, "approved"),
+    onReject: () => decideRow(r, "rejected"),
+    remarksValue: remarksFor(r),
+    onRemarksChange: (v) => setRemarksInputs((s) => ({ ...s, [r.key]: v })),
+    onRemarksBlur: () => saveRemarks(r),
+    showSelection,
+    selected: selectedRows.has(r.key),
+    onToggleSelect: () => toggleOneRow(r.key),
+    partialOpen: !!expandedPartials[r.key],
+    onTogglePartial: () => setExpandedPartials((m) => ({ ...m, [r.key]: !m[r.key] })),
+    colSpan: viewBy === "product" ? productColCount : customerColCount,
+  });
+
   return (
     <Layout pageTitle="Marketing Review">
       <div className="font-body">
+        {/* Partial parent = orange; balance (dropdown) row = white; no hover colour change on either. */}
+        <style>{`
+          .data-dark tbody tr.mr-partial-parent > td,
+          .data-dark tbody tr.mr-partial-parent:hover > td { background: ${PARTIAL_ROW_BG} !important; }
+          .data-dark tbody tr.mr-balance-row > td,
+          .data-dark tbody tr.mr-balance-row:hover > td { background: #fff !important; }
+        `}</style>
+
         <div className="mr-grid mr-grid-4 mr-mb-5">
-          {isSystemAdminRole ? (
-            <>
-              <StatCardV2 icon={Hourglass} label="Pending Final Approval" value={pendingFinalApprovalCount} accent="#D69426"
-                onViewDetails={() => goToSalesOrder("pending_final_approval")} />
-              <StatCardV2 icon={ClipboardList} label="Approved Orders Today" value={approvedTodayCount} accent="#2E6B9E"
-                onViewDetails={() => goToSalesOrder("approved_today")} />
-              <StatCardV2 icon={PackageCheck} label="Total Order Value" value={`₹${totalOrderValue.toLocaleString()}`} accent="#2E7A72"
-                onViewDetails={() => goToSalesOrder("total_order_value")} />
-              <StatCardV2 icon={Truck} label="ERP Transfer Pending" value={erpTransferPendingCount} accent="#B23A3A"
-                onViewDetails={() => goToSalesOrder("erp_transfer_pending")} />
-            </>
-          ) : (
+          {isSystemAdminRole ? statCardsSys : (
             <>
               <StatCardV2 icon={ClipboardList} label="Today's Inquiries" value={todayInquiriesCount} accent="#2E6B9E"
                 onViewDetails={() => goToSalesOrder("today_inquiries")} />
               <StatCardV2 icon={Hourglass} label="Pending Allocation" value={pendingAllocationCount} accent="#D69426"
                 onViewDetails={() => goToSalesOrder("pending_allocation")} />
-              <StatCardV2 icon={PackageCheck} label="Available Stock" value={`${totalAvailableStockAll.toLocaleString()} Pcs`} accent="#2E7A72"
-                onViewDetails={() => goToSalesOrder("available_stock")} />
+              <StatCardV2 icon={PackageCheck} label="Available Stock" value={`${totalAvailableStockAll.toLocaleString()} Mtr`} accent="#2E7A72"
+                onViewDetails={() => navigate("/master/available-stock")} />
               <StatCardV2 icon={Hourglass} label="Awaiting Approval" value={awaitingApprovalCount} accent="#B23A3A"
                 onViewDetails={() => goToSalesOrder("awaiting_approval")} />
             </>
           )}
         </div>
 
-        {error && <div className="tag tag-hold mr-mb-4" style={{ display: "block", padding: "10px 14px" }}>{error}</div>}
+        {focusIds.length > 0 && (
+          <div className="tag tag-pending mr-mb-4" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px" }}>
+            <span>Showing balance allocation for enquiry <b>{focusEnquiry}</b></span>
+            <button className="btn btn-ghost btn-sm" data-no-confirm onClick={() => setFocusIds([])}>Show all</button>
+          </div>
+        )}
+
+        {error && <div className="tag tag-hold mr-mb-4" style={{ display: "block", padding: "10px 14px", whiteSpace: "pre-line" }}>{error}</div>}
         {ok && <div className="tag tag-approved mr-mb-4" style={{ display: "block", padding: "10px 14px" }}>{ok}</div>}
 
         <div className="card mr-p-3 mr-mb-4">
-          <div style={{ display: "flex", flexWrap: "nowrap", gap: "12px", overflowX: "auto" }}>
+          <div style={{ display: "flex", flexWrap: "nowrap", gap: "12px", overflowX: "auto", alignItems: "flex-end" }}>
             <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
-              <label className="field-label">Inquiry Date</label>
-              <input type="date" className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} value={inquiryDate} onChange={(e) => setInquiryDate(e.target.value)} />
+              <label className="field-label">Enquiry Date</label>
+              <input type="date" className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box", borderColor: "#9AA7B5" }} value={inquiryDate} onChange={(e) => setInquiryDate(e.target.value)} />
+            </div>
+            <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
+              <label className="field-label">Enquiry No</label>
+              <AutocompleteInput value={enquiryNoSearch} onChange={setEnquiryNoSearch} options={enquiryNoOptions} placeholder="Search Enquiry No" />
             </div>
             <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
               <label className="field-label">Customer Name</label>
-              <input type="text" placeholder="Search Customer" className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} value={customerSearch} onChange={(e) => setCustomerSearch(e.target.value)} />
+              <AutocompleteInput value={customerSearch} onChange={setCustomerSearch} options={customerNameOptions} placeholder="Search Customer" />
             </div>
             <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
-              <label className="field-label">Product</label>
-              <input type="text" placeholder="Search Product" className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} value={productSearch} onChange={(e) => setProductSearch(e.target.value)} />
+              <label className="field-label">State</label>
+              <select className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box", borderColor: "#9AA7B5" }} value={stateFilter}
+                onChange={(e) => { const v = e.target.value; setStateFilter(v); if (v && districtFilter && !districtsOfState(v).includes(districtFilter)) setDistrictFilter(""); }}>
+                <option value="">All States</option>
+                {INDIA_STATES.map((st) => <option key={st} value={st}>{st}</option>)}
+              </select>
             </div>
             <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
-              <label className="field-label">Region</label>
-              <select className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)}>
-                <option value="">All Regions</option>
-                {regionOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+              <label className="field-label">District</label>
+              <select className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box", borderColor: "#9AA7B5" }} value={districtFilter} onChange={(e) => setDistrictFilter(e.target.value)}>
+                <option value="">{stateFilter ? `All Districts (${stateFilter})` : "All Districts"}</option>
+                {districtsOfState(stateFilter).map((d) => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
             <div style={{ flex: "1 1 0%", minWidth: 0, boxSizing: "border-box" }}>
               <label className="field-label">Sales Officer</label>
-              <select className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} value={officerFilter} onChange={(e) => setOfficerFilter(e.target.value)}>
+              <select className="field" style={{ width: "100%", minWidth: 0, boxSizing: "border-box", borderColor: "#9AA7B5" }} value={officerFilter} onChange={(e) => setOfficerFilter(e.target.value)}>
                 <option value="">All</option>
                 {officerOptions.map((n) => <option key={n} value={n}>{n}</option>)}
               </select>
             </div>
-          </div>
-          <div className="mr-flex mr-items-center mr-gap-2" style={{ marginTop: 20 }}>
-            <button className="btn btn-primary btn-sm" onClick={loadBoard}><Search size={12} /> Search</button>
-            <button className="btn btn-ghost btn-sm" onClick={() => { setCustomerSearch(""); setProductSearch(""); setInquiryDate(""); setRegionFilter(""); setOfficerFilter(""); setGlobalSearch(""); setAllocStatusFilter(""); }}>Clear</button>
+            <div style={{ flex: "0 0 auto", display: "flex", gap: 8 }}>
+              <button className="btn btn-primary btn-sm" style={{ padding: "7px 14px", fontSize: 12.5, whiteSpace: "nowrap", background: "#1C7A4B" }} onClick={loadBoard}><Search size={12} /> Search</button>
+              <button className="btn btn-ghost btn-sm" style={{ padding: "7px 14px", fontSize: 12.5, whiteSpace: "nowrap" }} onClick={() => { setCustomerSearch(""); setEnquiryNoSearch(""); setProductSearch(""); setInquiryDate(""); setStateFilter(""); setDistrictFilter(""); setOfficerFilter(""); setGlobalSearch(""); setAllocStatusFilter(""); setUomStatusFilter(""); setFocusIds([]); }}>Clear</button>
+            </div>
           </div>
         </div>
 
-        <div className="mr-flex mr-gap-3 mr-flex-wrap mr-mb-4">
+        <div className="mr-flex mr-gap-3 mr-mb-4" style={{ flexWrap: "nowrap", overflowX: "auto" }}>
           {CATEGORY_GROUPS.map((g) => {
             const Icon = g.icon;
             const active = activeCat === g.id;
@@ -1175,43 +1315,18 @@ export default function Batches() {
               </button>
             );
           })}
-          <button
-            onClick={() => setActiveCat("all")}
-            className={`cat-tab ${activeCat === "all" ? "active" : ""}`}
-            style={{ background: "#0F2138" }}
-          >
-            <span className="cat-tab-icon"><LayoutGrid size={15} color="#fff" /></span>
-            <span className="mr-text-left">All Orders<span className="cat-tab-count">{catCounts.all || 0} Order Lines</span></span>
-          </button>
         </div>
 
-        {/* Global search — sits above the "Showing <tab> items only" note,
-            searching product/customer name+code and Order No. across every
-            visible row regardless of the field-specific filters above. */}
-        <div className="mr-mb-3" style={{ position: "relative", maxWidth: 420 }}>
-          <Search size={14} style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "#8C96A3" }} />
-          <input
-            type="text"
-            placeholder="Search product, customer or order no…"
-            className="field"
-            style={{ width: "100%", boxSizing: "border-box", paddingLeft: 34 }}
+        <div style={{ position: "relative", maxWidth: 760, marginBottom: 22 }}>
+          <Search size={16} style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: "#8C96A3", zIndex: 2, pointerEvents: "none" }} />
+          <AutocompleteInput
             value={globalSearch}
-            onChange={(e) => setGlobalSearch(e.target.value)}
+            onChange={setGlobalSearch}
+            options={globalSearchOptions}
+            placeholder="Search product, customer, order no, sort no or shade…"
+            inputStyle={{ paddingLeft: 40, padding: "10px 14px 10px 40px", fontSize: 13.5 }}
           />
         </div>
-
-        {/* Alerts (partial allocations, and role-specific approved /
-            rejected / ERP-created / remarks summaries) now live in a
-            single popup dialog instead of inline strips — see AlertModal
-            below. It auto-opens once the board finishes loading if
-            there's anything to show; re-open manually if needed. */}
-        {/* {(partialAlerts.length > 0 || approvedAlerts.length > 0 || rejectedAlerts.length > 0 || erpCreatedAlerts.length > 0 || adminRemarksAlerts.length > 0) && (
-          <div className="mr-mb-3">
-            <button className="btn btn-ghost btn-sm" onClick={() => setAlertModalOpen(true)}>
-              <AlertTriangle size={12} /> View Alerts
-            </button>
-          </div>
-        )} */}
 
         <AlertModal
           open={alertModalOpen}
@@ -1277,10 +1392,6 @@ export default function Batches() {
           ]}
         />
 
-        {/* View By switch + Export Excel / Print Summary sit directly
-            above the table; the "Showing <tab> items only" note sits right
-            underneath them, in that same middle band between the filters
-            and the table. */}
         <div className="mr-flex mr-items-center mr-gap-4 mr-mb-3 mr-flex-wrap mr-text-sm">
           <span className="text-slate mr-font-medium">View By:</span>
           <label className="mr-flex mr-items-center mr-gap-1 mr-cursor-pointer">
@@ -1289,368 +1400,351 @@ export default function Batches() {
           <label className="mr-flex mr-items-center mr-gap-1 mr-cursor-pointer">
             <input type="radio" checked={viewBy === "customer"} onChange={() => setViewBy("customer")} /> Customer Wise View
           </label>
-          <div className="mr-flex mr-gap-2" style={{ marginLeft: "auto" }}>
-            <button onClick={handleExportExcel} className="btn btn-sm btn-excel"><FileDown size={12} /> Export Excel</button>
-            <button onClick={handlePrintSummary} className="btn btn-sm btn-print"><Printer size={12} /> Print Summary</button>
+          <div className="mr-flex mr-items-center mr-gap-2" style={{ marginLeft: "auto" }}>
+            <select className="field" style={{ minWidth: 110, padding: "7px 10px", fontSize: 12.5, borderColor: "#9AA7B5" }} value={uomStatusFilter} onChange={(e) => setUomStatusFilter(e.target.value)}>
+              <option value="">All UOM</option>
+              {uomOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+            <select className="field" style={{ minWidth: 150, padding: "7px 10px", fontSize: 12.5, borderColor: "#9AA7B5" }} value={allocStatusFilter} onChange={(e) => setAllocStatusFilter(e.target.value)}>
+              {(isSystemAdminRole ? SYSADMIN_STATUS_OPTIONS : ADMIN_STATUS_OPTIONS).map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <button onClick={handleExportExcel} className="btn btn-sm btn-excel" style={{ padding: "9px 16px", fontSize: 13 }}><FileDown size={13} /> Export Excel</button>
+            <button onClick={handlePrintSummary} className="btn btn-sm btn-print" style={{ padding: "9px 16px", fontSize: 13 }}><Printer size={13} /> Print Summary</button>
           </div>
         </div>
-        {activeCatLabel && (
-          <div className="mr-mb-3">
-            {/* <span className="tag" style={{ background: CATEGORY_GROUPS.find((g) => g.id === activeCat)?.tagBg, color: CATEGORY_GROUPS.find((g) => g.id === activeCat)?.tagText }}>
-              Showing {activeCatLabel} items only — other categories are hidden
-            </span> */}
-          </div>
-        )}
+        {activeCatLabel && <div className="mr-mb-3"></div>}
 
-        <div className="mr-lg-grid-main">
+        <div>
           <div className="card mr-p-3" style={{ minWidth: 0 }}>
-            <div className="mr-overflow-x-auto mr-table-viewport">
-            {loading ? (
-              <p className="mr-text-center mr-text-sm text-slate mr-py-8">Loading…</p>
-            ) : viewBy === "product" ? (
-              <table className="data-dark mr-w-full mr-product-table">
-                <colgroup>
-                  {showSelection && <col style={{ width: 40 }} />}
-                  <col style={{ width: 56 }} />
-                  <col style={{ width: 120 }} />
-                  <col style={{ width: 120 }} />
-                  <col style={{ width: 150 }} />
-                  <col style={{ width: 260 }} />
-                  {showCatColumn && <col style={{ width: 110 }} />}
-                  <col style={{ width: 110 }} />
-                  <col style={{ width: 120 }} />
-                  <col style={{ width: 150 }} />
-                  <col style={{ width: 120 }} />
-                  <col style={{ width: 130 }} />
-                  {isSystemAdminRole && <col style={{ width: 170 }} />}
-                  {isSystemAdminRole && <col style={{ width: 150 }} />}
-                  {isSystemAdminRole && <col style={{ width: 90 }} />}
-                </colgroup>
-                <thead>
-                  <tr>
-                    {showSelection && (
-                      <th style={{ width: 40 }}>
-                        <input
-                          type="checkbox"
-                          checked={allRowsSelected}
-                          onChange={() => toggleSelectAllRows(visibleRows.map((r) => r.key), allRowsSelected)}
-                          aria-label="Select all visible rows"
-                        />
-                      </th>
-                    )}
-                    <th>S.No</th>
-                    <th>Sort No</th>
-                    <th>Shade No</th>
-                    <th>Product Code</th>
-                    <th>Product Name</th>
-                    {showCatColumn && <th>Category</th>}
-                    <th className="mr-text-right">Requested Qty (Pcs)</th>
-                    <th className="mr-text-right">Available Stock (Pcs)</th>
-                    <th className="mr-text-right">Allocated Qty (Pcs)</th>
-                    <th className="mr-text-right">Total Value (₹)</th>
-                    <th><AllocationStatusHeaderFilter value={allocStatusFilter} onChange={setAllocStatusFilter} /></th>
-                    {isSystemAdminRole && <th>Remarks</th>}
-                    {isSystemAdminRole && <th>ERP SO Status</th>}
-                    {isSystemAdminRole && <th>Actions</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {productGroups.map((g, gIdx) => {
-                    const expanded = !!expandedProducts[g.productId];
-                    const groupStatusTag = isSystemAdminRole ? groupApprovalStatus(g) : groupStockStatus(g);
-                    const groupPendingRows = g.rows.filter((r) => r.status === "pending" && r.allocationId);
-                    const remarksFilledCount = g.rows.filter((r) => (remarksFor(r) || "").trim()).length;
-                    const groupErpTag = groupErpStatus(g);
-                    const groupPendingQty = g.requestedSum - g.allocatedSum;
-                    return (
-                      <Fragment key={g.productId}>
-                        {/* Always-visible totals row — every customer for
-                            this product added together. Click anywhere on
-                            it to expand the per-customer breakdown below.
-                            The expand/collapse chevron lives in the S.No
-                            cell, before the row number. */}
-                        <tr className="mr-product-group-row" onClick={() => toggleProductExpanded(g.productId)}>
-                          {showSelection && <td></td>}
-                          <td className="text-slate">
-                            <span className="mr-flex mr-items-center mr-gap-2">
-                              <span className="mr-product-chevron">
-                                {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                              </span>
-                              {gIdx + 1}
-                            </span>
-                          </td>
-                          <td className="text-slate">{g.sortNo}</td>
-                          <td className="text-slate">{g.shadeNo}</td>
-                          <td>
-                            <b className="text-pine">{g.productCode}</b>
-                          </td>
-                          <td className="mr-font-semibold text-pine">{g.productName}</td>
-                          {showCatColumn && (
-                            <td><span className="tag mr-font-semibold" style={{ background: g.group.tagBg, color: g.group.tagText }}>{g.group.name}</span></td>
-                          )}
-                          <td className="mr-font-semibold mr-text-right mr-tabular-nums">{g.requestedSum}</td>
-                          <td className="mr-text-right mr-tabular-nums" style={{ color: stockColor(g.requestedSum, g.poolAvailable, g.allocatedSum) }}>
-                            {g.poolAvailable}
-                          </td>
-                          <td className="mr-text-right mr-tabular-nums">{g.allocatedSum}</td>
-                          <td className="mr-text-right mr-tabular-nums">
-                            ₹{g.valueSum.toLocaleString()}
-                            {groupPendingQty > 0 && g.allocatedSum > 0 && (
-                              <div className="mr-text-xs" style={{ color: "#D69426" }}>
-                                Pending Qty: {groupPendingQty} Pcs
-                              </div>
-                            )}
-                          </td>
-                          <td>
-                            <span className={`tag ${groupStatusTag.cls}`}>{groupStatusTag.label}</span>
-                            {groupStatusTag.detail && <div className="mr-text-xs text-slate">{groupStatusTag.detail}</div>}
-                          </td>
-                          {isSystemAdminRole && (
-                            <td className="mr-text-xs text-slate mr-whitespace-nowrap">{remarksFilledCount}/{g.rows.length} added</td>
-                          )}
-                          {isSystemAdminRole && (
-                            <td className="mr-text-xs mr-whitespace-nowrap"><span className={`tag ${groupErpTag.cls}`}>{groupErpTag.label}</span></td>
-                          )}
-                          {isSystemAdminRole && (
-                            <td onClick={(e) => e.stopPropagation()}>
-                              <div className="mr-flex mr-gap-1">
-                                <button
-                                  onClick={() => bulkDecide("approved", groupPendingRows)}
-                                  disabled={groupPendingRows.length === 0}
-                                  title={groupPendingRows.length ? `Approve ${groupPendingRows.length} pending row(s) for this product` : "No pending rows for this product"}
-                                  className="btn btn-primary btn-sm"
-                                  style={{ padding: "3px 7px" }}
-                                >
-                                  <Check size={12} />
-                                </button>
-                                <button
-                                  onClick={() => bulkDecide("rejected", groupPendingRows)}
-                                  disabled={groupPendingRows.length === 0}
-                                  title={groupPendingRows.length ? `Reject ${groupPendingRows.length} pending row(s) for this product` : "No pending rows for this product"}
-                                  className="btn btn-ghost btn-sm"
-                                  style={{ padding: "3px 7px", color: "#B23A3A" }}
-                                >
-                                  <X size={12} />
-                                </button>
-                              </div>
-                            </td>
-                          )}
-                        </tr>
-                        {/* Sub-header — only shown once expanded, labels the
-                            per-customer identity columns just below. */}
-                        {expanded && (
-                          <tr className="mr-subhead-row">
+            <div className="mr-overflow-x-auto mr-table-viewport" style={{ maxHeight: 560, overflowY: "auto" }}>
+              {loading ? (
+                <p className="mr-text-center mr-text-sm text-slate mr-py-8">Loading…</p>
+              ) : viewBy === "product" ? (
+                <table className="data-dark mr-w-full mr-product-table">
+                  <colgroup>
+                    {showSelection && <col style={{ width: 40 }} />}
+                    <col style={{ width: 56 }} />
+                    <col style={{ width: 120 }} />
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 120 }} />
+                    <col style={{ width: 150 }} />
+                    <col style={{ width: 260 }} />
+                    <col style={{ width: 70 }} />
+                    <col style={{ width: 130 }} />
+                    <col style={{ width: 90 }} />
+                    <col style={{ width: 90 }} />
+                    <col style={{ width: 190 }} />
+                    <col style={{ width: 90 }} />
+                    {showCatColumn && <col style={{ width: 110 }} />}
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 120 }} />
+                    <col style={{ width: 150 }} />
+                    <col style={{ width: 100 }} />
+                    <col style={{ width: 130 }} />
+                    {isSystemAdminRole && <col style={{ width: 170 }} />}
+                    {isSystemAdminRole && <col style={{ width: 150 }} />}
+                    {isSystemAdminRole && <col style={{ width: 90 }} />}
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      {showSelection && (
+                        <th style={{ width: 40 }}>
+                          <input type="checkbox" checked={allRowsSelected} onChange={() => toggleSelectAllRows(visibleRows.map((r) => r.key), allRowsSelected)} aria-label="Select all visible rows" />
+                        </th>
+                      )}
+                      <th style={{ textAlign: "center" }}>S.No</th>
+                      <th style={{ textAlign: "center" }}>Sort No</th>
+                      <th style={{ textAlign: "center" }}>Enquiry Date</th>
+                      <th style={{ textAlign: "center" }}>Shade</th>
+                      <th style={{ textAlign: "center" }}>Product Code</th>
+                      <th style={{ textAlign: "center" }}>Product Name</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Tax</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Payment</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>CD Flag</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Price</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Delivery Point</th>
+                      <th style={{ textAlign: "center" }}>UOM</th>
+                      {showCatColumn && <th style={{ textAlign: "center" }}>Category</th>}
+                      <th style={{ textAlign: "center" }}>Requested Qty</th>
+                      <th style={{ textAlign: "center" }}>Available Stock</th>
+                      <th style={{ textAlign: "center" }}>{isSystemAdminRole ? "Confirmed Qty" : "Allocated Qty"}</th>
+                      <th style={{ textAlign: "center" }}>Allocated Mtr</th>
+                      <th style={{ textAlign: "center" }}>Allocation Status</th>
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>Remarks</th>}
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>ERP SO Status</th>}
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>Actions</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {productGroups.map((g, gIdx) => {
+                      const expanded = !!expandedProducts[g.productId];
+                      const groupStatusTag = isSystemAdminRole ? groupApprovalStatus(g) : groupStockStatus(g);
+                      const groupPendingRows = g.rows.filter((r) => r.status === "pending" && r.allocationId);
+                      const remarksFilledCount = g.rows.filter((r) => (remarksFor(r) || "").trim()).length;
+                      const groupErpTag = groupErpStatus(g);
+                      return (
+                        <Fragment key={g.productId}>
+                          <tr className="mr-product-group-row" onClick={() => toggleProductExpanded(g.productId)}>
                             {showSelection && <td></td>}
-                            <td></td>
-                            <td>Order No.</td>
-                            <td>Customer Name</td>
-                            <td>Customer Code</td>
-                            <td></td>
-                            {showCatColumn && <td>Category</td>}
-                            <td className="mr-text-right">Requested Qty (Pcs)</td>
-                            <td className="mr-text-right">Available Stock (Pcs)</td>
-                            <td className="mr-text-right">Allocated Qty (Pcs)</td>
-                            <td className="mr-text-right">Total Value (₹)</td>
-                            <td>Allocation Status</td>
-                            {isSystemAdminRole && <td>Remarks</td>}
-                            {isSystemAdminRole && <td>ERP SO Status</td>}
-                            {isSystemAdminRole && <td>Actions</td>}
+                            <td className="text-slate mr-text-center">
+                              <span className="mr-flex mr-items-center mr-justify-center mr-gap-2">
+                                <span className="mr-product-chevron">
+                                  {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                                </span>
+                                {gIdx + 1}
+                              </span>
+                            </td>
+                            <td className="text-slate mr-text-center">{g.sortNo}</td>
+                            <td className="text-slate mr-text-center">—</td>
+                            <td className="text-slate mr-text-center">{g.shadeNo}</td>
+                            {/* Product Code / Name: first 5 words + "...", full text in the hover card */}
+                            <td className="mr-text-center">
+                              <HoverCard code={g.productCode} name={g.productName}>
+                                <b className="text-pine">{truncateWords(g.productCode)}</b>
+                              </HoverCard>
+                            </td>
+                            <td className="mr-font-semibold text-pine mr-text-center">
+                              <HoverCard code={g.productCode} name={g.productName}>
+                                {truncateWords(g.productName)}
+                              </HoverCard>
+                            </td>
+                            <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{dummyTax(g.productId)}</td>
+                            <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{dummyPayment(g.productId)}</td>
+                            <td className="text-slate mr-text-center">—</td>
+                            <td className="text-slate mr-text-center">—</td>
+                            <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{dummyDeliveryPoint(g.productId)}</td>
+                            <td className="mr-text-xs text-slate mr-text-center">{g.uom ? uomLabel(g.uom) : "—"}</td>
+                            {showCatColumn && (
+                              <td className="mr-whitespace-nowrap mr-text-center"><span className="tag mr-font-semibold" style={{ background: g.group.tagBg, color: g.group.tagText, whiteSpace: "nowrap" }}>{g.group.name}</span></td>
+                            )}
+                            <td className="mr-font-semibold mr-text-center mr-tabular-nums">{g.requestedSum}</td>
+                            <td className="mr-text-center mr-tabular-nums" style={{ color: stockColor(g.requestedSum, g.poolAvailable, g.allocatedSum) }}>{g.poolAvailable}</td>
+                            <td className="mr-text-center mr-tabular-nums">{g.allocatedSum}</td>
+                            {/* Total Mtr for this product = Σ (Allocated Qty × Mtr) of its orders */}
+                            <td className="mr-text-center mr-text-xs mr-font-semibold mr-tabular-nums text-slate">{fmtMtr(g.mtrSum)}</td>
+                            <td className="mr-text-center">
+                              <span className={`tag ${groupStatusTag.cls}`}>{groupStatusTag.label}</span>
+                            </td>
+                            {isSystemAdminRole && (
+                              <td className="mr-text-xs text-slate mr-whitespace-nowrap mr-text-center">{remarksFilledCount}/{g.rows.length} added</td>
+                            )}
+                            {isSystemAdminRole && (
+                              <td className="mr-text-xs mr-whitespace-nowrap mr-text-center"><span className={`tag ${groupErpTag.cls}`}>{groupErpTag.label}</span></td>
+                            )}
+                            {isSystemAdminRole && (
+                              <td onClick={(e) => e.stopPropagation()} className="mr-text-center">
+                                <div className="mr-flex mr-justify-center mr-gap-1">
+                                  <button
+                                    onClick={() => bulkDecide("approved", groupPendingRows)}
+                                    data-confirm={`Approve ${groupPendingRows.length} pending order(s) for this product?`}
+                                    data-confirm-title="Approve Orders"
+                                    disabled={groupPendingRows.length === 0}
+                                    title={groupPendingRows.length ? `Approve ${groupPendingRows.length} pending row(s) for this product` : "No pending rows for this product"}
+                                    className="btn btn-primary btn-sm"
+                                    style={{ padding: "3px 7px" }}
+                                  >
+                                    <Check size={12} />
+                                  </button>
+                                  <button
+                                    onClick={() => bulkDecide("rejected", groupPendingRows)}
+                                    data-confirm={`Reject ${groupPendingRows.length} pending order(s) for this product?`}
+                                    data-confirm-title="Reject Orders"
+                                    disabled={groupPendingRows.length === 0}
+                                    title={groupPendingRows.length ? `Reject ${groupPendingRows.length} pending row(s) for this product` : "No pending rows for this product"}
+                                    className="btn btn-ghost btn-sm"
+                                    style={{ padding: "3px 7px", color: "#B23A3A" }}
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </div>
+                              </td>
+                            )}
                           </tr>
-                        )}
-                        {expanded && g.rows.map((r) => (
-                          <AllocationRow
-                            key={r.key}
-                            r={r}
-                            sNo={null}
-                            available={liveAvailableByProduct.get(r.productId) ?? r.poolAvailable}
-                            showCatColumn={showCatColumn}
-                            showProductCols={false}
-                            canManage={canManage}
-                            inputValue={allocFor(r)}
-                            allocated={totalAllocFor(r)}
-                            onAlloc={(v) => setAlloc(r, v)}
-                            onAutoAllocate={() => autoAllocateRow(r)}
-                            statusTag={isSystemAdminRole ? approvalStatus(r) : stockStatus(r, liveAvailableByProduct.get(r.productId) ?? r.poolAvailable, totalAllocFor(r))}
-                            isSystemAdminRole={isSystemAdminRole}
-                            busy={busyDecision.has(r.allocationId)}
-                            onApprove={() => decideRow(r, "approved")}
-                            onReject={() => decideRow(r, "rejected")}
-                            remarksValue={remarksFor(r)}
-                            onRemarksChange={(v) => setRemarksInputs((s) => ({ ...s, [r.key]: v }))}
-                            onRemarksBlur={() => saveRemarks(r)}
-                            showSelection={showSelection}
-                            selected={selectedRows.has(r.key)}
-                            onToggleSelect={() => toggleOneRow(r.key)}
-                          />
-                        ))}
-                      </Fragment>
-                    );
-                  })}
-                  {productGroups.length === 0 && (
-                    <tr><td colSpan={productColCount} className="mr-text-center mr-text-sm text-slate mr-py-8">No active order demand in this view.</td></tr>
-                  )}
-                </tbody>
-                {productGroups.length > 0 && (
-                  <tfoot>
-                    <tr>
-                      <td colSpan={(showCatColumn ? 6 : 5) + (showSelection ? 1 : 0)}>Total</td>
-                      <td className="mr-text-right mr-tabular-nums">{totals.requested}</td>
-                      <td></td>
-                      <td className="mr-text-right mr-tabular-nums">{totals.allocated}</td>
-                      <td className="mr-text-right mr-tabular-nums">₹{totals.value.toLocaleString()}</td>
-                      <td></td>
-                      {isSystemAdminRole && <><td></td><td></td><td></td></>}
-                    </tr>
-                  </tfoot>
-                )}
-              </table>
-            ) : (
-              <table className="data-dark mr-w-full">
-
-                <thead>
-                  <tr>
-                    {showSelection && (
-                      <th style={{ width: 34 }}>
-                        <input
-                          type="checkbox"
-                          checked={allRowsSelected}
-                          onChange={() => toggleSelectAllRows(visibleRows.map((r) => r.key), allRowsSelected)}
-                          aria-label="Select all visible rows"
-                        />
-                      </th>
+                          {expanded && (
+                            <tr className="mr-subhead-row">
+                              {showSelection && <td></td>}
+                              <td></td>
+                              <td>Enquiry No.</td>
+                              <td>Enquiry Date</td>
+                              <td>Customer Name</td>
+                              <td>Customer Code</td>
+                              <td></td>
+                              <td>Tax</td>
+                              <td>Payment</td>
+                              <td>CD Flag</td>
+                              <td>Price</td>
+                              <td>Delivery Point</td>
+                              <td>UOM</td>
+                              {showCatColumn && <td>Category</td>}
+                              <td className="mr-text-center">Requested Qty</td>
+                              <td className="mr-text-center">Available Stock</td>
+                              <td className="mr-text-center">Allocated Quantity</td>
+                              <td className="mr-text-center">Allocated Mtr</td>
+                              <td>Allocation Status</td>
+                              {isSystemAdminRole && <td>Remarks</td>}
+                              {isSystemAdminRole && <td>ERP SO Status</td>}
+                              {isSystemAdminRole && <td>Actions</td>}
+                            </tr>
+                          )}
+                          {expanded && g.rows.map((r) => (
+                            <AllocationRow key={r.key} showProductCols={false} {...rowProps(r, null)} />
+                          ))}
+                        </Fragment>
+                      );
+                    })}
+                    {productGroups.length === 0 && (
+                      <tr><td colSpan={productColCount} className="mr-text-center mr-text-sm text-slate mr-py-8">No active order demand in this view.</td></tr>
                     )}
-                    <th>S.No</th>
-                    <th>Order No.</th>
-                    <th>Customer Code</th>
-                    <th>Product Code</th>
-                    <th>Customer Name</th>
-                    <th>Product Description</th>
-                    {showCatColumn && <th>Category</th>}
-                    <th className="mr-text-right">Requested Qty (Pcs)</th>
-                    <th className="mr-text-right">Available Stock (Pcs)</th>
-                    <th className="mr-text-right">Allocated Qty (Pcs)</th>
-                    <th className="mr-text-right">Total Value (₹)</th>
-                    <th><AllocationStatusHeaderFilter value={allocStatusFilter} onChange={setAllocStatusFilter} /></th>
-                    {isSystemAdminRole && <th>Remarks</th>}
-                    {isSystemAdminRole && <th>ERP SO Status</th>}
-                    {isSystemAdminRole && <th>Actions</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleRows.map((r, idx) => (
-                    <AllocationRow
-                      key={r.key}
-                      r={r}
-                      sNo={idx + 1}
-                      available={liveAvailableByProduct.get(r.productId) ?? r.poolAvailable}
-                      showCatColumn={showCatColumn}
-                      showProductCols
-                      canManage={canManage}
-                      inputValue={allocFor(r)}
-                      allocated={totalAllocFor(r)}
-                      onAlloc={(v) => setAlloc(r, v)}
-                      onAutoAllocate={() => autoAllocateRow(r)}
-                      statusTag={isSystemAdminRole ? approvalStatus(r) : stockStatus(r, liveAvailableByProduct.get(r.productId) ?? r.poolAvailable, totalAllocFor(r))}
-                      isSystemAdminRole={isSystemAdminRole}
-                      busy={busyDecision.has(r.allocationId)}
-                      onApprove={() => decideRow(r, "approved")}
-                      onReject={() => decideRow(r, "rejected")}
-                      remarksValue={remarksFor(r)}
-                      onRemarksChange={(v) => setRemarksInputs((s) => ({ ...s, [r.key]: v }))}
-                      onRemarksBlur={() => saveRemarks(r)}
-                      showSelection={showSelection}
-                      selected={selectedRows.has(r.key)}
-                      onToggleSelect={() => toggleOneRow(r.key)}
-                    />
-                  ))}
-                  {visibleRows.length === 0 && (
-                    <tr><td colSpan={customerColCount} className="mr-text-center mr-text-sm text-slate mr-py-8">No active order demand in this view.</td></tr>
+                  </tbody>
+                  {productGroups.length > 0 && (
+                    <tfoot>
+                      <tr className="mr-totals-row" style={{ position: "sticky", bottom: 0, zIndex: 2 }}>
+                        <td colSpan={productFooterSpan}></td>
+                        <td className="mr-text-center mr-font-semibold">Total</td>
+                        <td className="mr-text-center mr-tabular-nums">{totals.requested}</td>
+                        <td></td>
+                        <td className="mr-text-center mr-tabular-nums">{totals.allocated}</td>
+                        {/* Grand total Mtr across every product shown */}
+                        <td className="mr-text-center mr-tabular-nums mr-font-semibold">{fmtMtr(totals.mtr)}</td>
+                        <td></td>
+                        {isSystemAdminRole && <><td></td><td></td><td></td></>}
+                      </tr>
+                    </tfoot>
                   )}
-                </tbody>
-                {visibleRows.length > 0 && (
-                  <tfoot>
+                </table>
+              ) : (
+                <table className="data-dark mr-w-full">
+                  <thead>
                     <tr>
-                      <td colSpan={(showCatColumn ? 7 : 6) + (showSelection ? 1 : 0)}>Total</td>
-                      <td className="mr-text-right mr-tabular-nums">{totals.requested}</td>
-                      <td></td>
-                      <td className="mr-text-right mr-tabular-nums">{totals.allocated}</td>
-                      <td className="mr-text-right mr-tabular-nums">₹{totals.value.toLocaleString()}</td>
-                      <td></td>
-                      {isSystemAdminRole && <><td></td><td></td><td></td></>}
+                      {showSelection && (
+                        <th style={{ width: 34 }}>
+                          <input type="checkbox" checked={allRowsSelected} onChange={() => toggleSelectAllRows(visibleRows.map((r) => r.key), allRowsSelected)} aria-label="Select all visible rows" />
+                        </th>
+                      )}
+                      <th style={{ textAlign: "center" }}>S.No</th>
+                      <th style={{ textAlign: "center" }}>Enquiry No</th>
+                      <th style={{ textAlign: "center" }}>Enquiry Date</th>
+                      <th style={{ textAlign: "center" }}>Customer Name</th>
+                      {isSystemAdminRole ? (
+                        <th style={{ textAlign: "center" }}>Customer Code</th>
+                      ) : (
+                        <>
+                          <th style={{ textAlign: "center" }}>Product Code</th>
+                          <th style={{ textAlign: "center" }}>Product Name</th>
+                        </>
+                      )}
+                      {showCatColumn && <th style={{ textAlign: "center" }}>Category</th>}
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Tax</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Payment</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>CD Flag</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Price</th>
+                      <th style={{ textAlign: "center", whiteSpace: "nowrap" }}>Delivery Point</th>
+                      <th style={{ textAlign: "center" }}>UOM</th>
+                      <th style={{ textAlign: "center" }}>Requested Qty</th>
+                      {!isSystemAdminRole && <th style={{ textAlign: "center" }}>Available Stock</th>}
+                      <th style={{ textAlign: "center" }}>{isSystemAdminRole ? "Confirmed Qty" : "Allocated Qty"}</th>
+                      <th style={{ textAlign: "center" }}>Allocated Mtr</th>
+                      <th style={{ textAlign: "center" }}>Allocation Status</th>
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>Remarks</th>}
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>ERP SO Status</th>}
+                      {isSystemAdminRole && <th style={{ textAlign: "center" }}>Actions</th>}
                     </tr>
-                  </tfoot>
-                )}
-              </table>
-            )}
+                  </thead>
+                  <tbody>
+                    {visibleRows.map((r, idx) => (
+                      <AllocationRow key={r.key} showProductCols {...rowProps(r, idx + 1)} />
+                    ))}
+                    {visibleRows.length === 0 && (
+                      <tr><td colSpan={customerColCount} className="mr-text-center mr-text-sm text-slate mr-py-8">No active order demand in this view.</td></tr>
+                    )}
+                  </tbody>
+                  {visibleRows.length > 0 && (
+                    <tfoot>
+                      <tr className="mr-totals-row" style={{ position: "sticky", bottom: 0, zIndex: 2 }}>
+                        <td colSpan={customerFooterSpan}></td>
+                        <td className="mr-text-center mr-font-semibold">Total</td>
+                        <td className="mr-text-center mr-tabular-nums">{totals.requested}</td>
+                        {!isSystemAdminRole && <td></td>}
+                        <td className="mr-text-center mr-tabular-nums">{totals.allocated}</td>
+                        {/* Grand total Mtr across every row shown */}
+                        <td className="mr-text-center mr-tabular-nums mr-font-semibold">{fmtMtr(totals.mtr)}</td>
+                        <td></td>
+                        {isSystemAdminRole && <><td></td><td></td><td></td></>}
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              )}
             </div>
 
             {canManage && (
               <div className="mr-flex mr-flex-wrap mr-gap-2 mr-justify-center mr-sticky-actions">
-                <button onClick={handleApprovalClick} disabled={saving} className="btn btn-primary btn-sm">
-                  <Send size={12} />{" "}
+                <button
+                  onClick={handleApprovalClick}
+                  disabled={saving}
+                  style={{ background: "#1C7A4B" }}
+                  className="btn btn-primary btn-sm"
+                  data-confirm={isSystemAdminRole && selectedEligibleForDecision.length > 0
+                    ? `Approve ${selectedEligibleForDecision.length} selected order(s)?`
+                    : isSystemAdminRole
+                      ? undefined
+                      : "Submit the allocated orders to System Admin for approval?"}
+                  data-confirm-title="Approval"
+                >
+                  <Send size={20} />{" "}
                   {saving
                     ? "Saving…"
                     : isSystemAdminRole && selectedEligibleForDecision.length > 0
                       ? `Approve ${selectedEligibleForDecision.length} Selected`
                       : "Approval"}
                 </button>
-                <button onClick={handleReset} className="btn btn-sm btn-reset"><RotateCcw size={12} /> Reset Allocation</button>
+                <button onClick={handleReset} className="btn btn-sm btn-reset"><RotateCcw size={13} /> Reset Allocation</button>
                 {isSystemAdminRole && (
                   <button
                     onClick={handleTransferToErp}
+                    data-confirm={`Transfer ${erpTransferPendingCount} approved order(s) to ERP?`}
+                    data-confirm-title="Transfer to ERP"
                     disabled={transferringErp || erpTransferPendingCount === 0}
                     title={erpTransferPendingCount === 0 ? "No Approved rows waiting for ERP transfer" : `Transfer ${erpTransferPendingCount} Approved row(s) to ERP`}
                     className="btn btn-sm btn-erp"
                   >
-                    <Truck size={12} /> {transferringErp ? "Transferring…" : "Transfer to ERP"}
+                    <Truck size={20} /> {transferringErp ? "Transferring…" : "Transfer to ERP"}
                   </button>
                 )}
-                <button onClick={handleSaveDraft} className="btn btn-sm btn-draft"><FileText size={12} /> Save Draft</button>
+                <button onClick={handleSaveDraft} className="btn btn-sm btn-draft"><FileText size={20} /> Save Draft</button>
               </div>
             )}
           </div>
 
-          <div className="mr-flex-col mr-gap-4">
-            <SummaryPanel
-              title="Allocation Summary"
-              rows={[
-                { label: "Total Customers", value: distinctCustomers },
-                { label: "Total Requested Qty", value: `${totals.requested} Pcs` },
-                { label: "Total Allocated Qty", value: `${totals.allocated} Pcs` },
-                { label: "Balance Stock", value: `${totalStockScope.toLocaleString()} Pcs` },
-                { label: "Pending Final Approval", value: `${pendingFinalApprovalCount} Line(s)`, color: "#D69426" },
-                { label: "Total Allocation Value (₹)", value: `₹${totals.value.toLocaleString()}`, color: "#2E7A72" },
-              ]}
-            />
-          </div>
+          <SummaryBar
+            title="Allocation Summary"
+            rows={[
+              { label: "Total Customers", value: distinctCustomers },
+              { label: "Total Requested Qty", value: `${totals.requested} Pcs` },
+              { label: "Total Allocated Qty", value: `${totals.allocated} Pcs` },
+              { label: "Total Allocated Mtr", value: fmtMtr(totals.mtr), color: "#2E6B9E" },
+              { label: "Balance Stock", value: `${totalStockScope.toLocaleString()} Pcs` },
+              { label: "Pending Final Approval", value: `${pendingFinalApprovalCount} Line(s)`, color: "#D69426" },
+            ]}
+          />
         </div>
       </div>
     </Layout>
   );
 }
 
-// ── Popup alert modal (replaces the old always-visible inline strips) ──
-// Groups every alert category (partial allocations, and — depending on
-// role — approved/rejected/ERP-created or remarks-from-System-Admin) into
-// one centered dialog with a dimmed backdrop. Renders nothing if there's
-// nothing to show. Both OK and Cancel simply dismiss it; clicking the
-// backdrop also dismisses it.
+// ── Popup alert modal ──
 function AlertModal({ open, onClose, sections }) {
   const visibleSections = sections.filter((s) => s.items.length > 0);
   if (!open || visibleSections.length === 0) return null;
   return (
     <div
-      style={{
-        position: "fixed", inset: 0, background: "rgba(15,33,56,0.55)",
-        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
-      }}
+      style={{ position: "fixed", inset: 0, background: "rgba(15,33,56,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
       onClick={onClose}
     >
-      <div
-        className="card"
-        style={{ maxWidth: 520, width: "92%", maxHeight: "80vh", overflowY: "auto", padding: 24 }}
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="card" style={{ maxWidth: 520, width: "92%", maxHeight: "80vh", overflowY: "auto", padding: 24 }} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ margin: "0 0 16px", color: "#0F2138" }}>Updates on this page</h3>
         {visibleSections.map((s, i) => (
           <div key={i} style={{ marginBottom: 16 }}>
@@ -1666,195 +1760,392 @@ function AlertModal({ open, onClose, sections }) {
           </div>
         ))}
         <div className="mr-flex mr-gap-2 mr-justify-center" style={{ marginTop: 20 }}>
-          <button className="btn btn-primary btn-sm" onClick={onClose}>OK</button>
-          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary btn-sm" data-no-confirm onClick={onClose}>OK</button>
+          <button className="btn btn-ghost btn-sm" data-no-confirm onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>
   );
 }
 
-// ── Shared allocation table row ─────────────────────────────────────────
-// `inputValue` = what the editable qty box shows/edits (an increment once
-// the row is already at ERP and still has outstanding qty). `allocated`
-// = the REAL cumulative total (base + increment) — used for the value
-// column, Pending Qty text, and (via the parent's statusTag calc) the
-// status badge.
-function AllocationRow({
-  r, sNo, available, showCatColumn, showProductCols, canManage, inputValue, allocated, onAlloc, onAutoAllocate, statusTag,
-  isSystemAdminRole, busy, onApprove, onReject, remarksValue, onRemarksChange, onRemarksBlur,
-  showSelection, selected, onToggleSelect,
-}) {
-  const value = allocated * r.price;
-  // Cap on the INPUT BOX itself: how much more can still be typed in,
-  // given remaining stock and (for Admin, if the base is already at ERP
-  // and there's still outstanding qty) remaining outstanding qty against
-  // the order. System Admin's box always represents the full total, so
-  // it's capped at the full requested qty instead.
-  const hasOutstanding = r.savedAllocated < r.requested;
-  const requestedCap = (!isSystemAdminRole && r.erpStatus === "erp_so_created" && hasOutstanding)
-    ? Math.max(0, r.requested - r.savedAllocated)
-    : r.requested;
-  const maxAlloc = Math.min(requestedCap, available + inputValue);
-  const canDecide = isSystemAdminRole && r.allocationId && r.status === "pending";
-  // Fully allocated — for EITHER role — once the real cumulative total
-  // has reached the requested qty, there's nothing left to type. Shown as
-  // a plain colored value instead of an editable input; the color matches
-  // the "Fully Allocated" tag used everywhere else on this page.
-  const isFullyAllocated = r.requested > 0 && allocated >= r.requested;
+// ── Hover card for Product Code / Product Name ──────────────────────────
+// Wraps the shortened (5-word) text. On hover it shows a small card with the
+// FULL Product Code and Product Name. The card is position:fixed (placed from
+// the hovered element's screen position) so the scrolling table container can
+// never clip it. It flips above the text when there is no room below.
+function HoverCard({ code, name, children }) {
+  const [pos, setPos] = useState(null);
+
+  const show = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const CARD_W = 380;
+    const half = CARD_W / 2;
+    const left = Math.min(Math.max(rect.left + rect.width / 2, half + 8), window.innerWidth - half - 8);
+    const below = rect.bottom + 150 < window.innerHeight;
+    setPos({ left, top: below ? rect.bottom + 6 : rect.top - 6, below });
+  };
+  const hide = () => setPos(null);
+
   return (
-    <tr>
-      {showSelection && (
-        <td>
-          <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`Select allocation row ${r.orderNo}`} />
-        </td>
-      )}
-      <td className="text-slate">{sNo != null ? sNo : ""}</td>
-      <td className="mr-text-xs mr-font-semibold text-pine mr-whitespace-nowrap">{r.orderNo}</td>
-      {showProductCols ? (
-        <>
-          <td className="mr-text-xs mr-whitespace-nowrap">{r.customerCode}</td>
-          <td className="mr-text-xs mr-whitespace-nowrap">{r.productCode}</td>
-          <td className="mr-font-medium">{r.customerName}</td>
-          <td className="mr-text-xs">{r.productName}</td>
-        </>
-      ) : (
-        <>
-          <td className="mr-font-medium">{r.customerName}</td>
-          <td className="mr-text-xs mr-whitespace-nowrap">{r.customerCode}</td>
-          <td></td> {/* spacer — lines up with the group row's Product Name column */}
-        </>
-      )}
-      {showCatColumn && (
-        <td><span className="tag mr-font-semibold" style={{ background: r.group.tagBg, color: r.group.tagText }}>{r.group.name}</span></td>
-      )}
-      <td className="mr-font-semibold mr-text-right mr-tabular-nums">{r.requested}</td>
-      <td className="mr-text-right mr-tabular-nums" style={{ color: stockColor(r.requested, available, allocated) }}>
-        {available}
-      </td>
-      <td className="mr-text-right">
-        {isFullyAllocated ? (
-          <span className="mr-font-semibold mr-tabular-nums" style={{ color: "#1C7A4B" }}>
-            {allocated}
-          </span>
-        ) : (
-          <div className="mr-flex mr-items-center mr-justify-end mr-gap-1">
-            <input
-              type="number" min={0} max={maxAlloc}
-              value={inputValue === 0 ? "" : inputValue}
-              placeholder="0"
-              disabled={!canManage}
-              onChange={(e) => onAlloc(e.target.value)}
-              className="field mr-text-right" style={{ width: 64, padding: "4px 6px" }}
-            />
-            {canManage && (
-              <button title={`Allocate max (${maxAlloc})`} onClick={onAutoAllocate} className="btn btn-ghost btn-sm" style={{ padding: 4 }}>
-                <Zap size={12} />
-              </button>
-            )}
+    <span
+      onMouseEnter={show}
+      onMouseLeave={hide}
+      style={{ display: "inline-block", cursor: "help", maxWidth: "100%" }}
+    >
+      {children}
+      {pos && (
+        <div
+          style={{
+            position: "fixed",
+            left: pos.left,
+            top: pos.top,
+            transform: pos.below ? "translateX(-50%)" : "translate(-50%, -100%)",
+            width: 380,
+            maxWidth: "calc(100vw - 16px)",
+            zIndex: 2000,
+            background: "#fff",
+            border: "1px solid #DBE3EC",
+            borderRadius: 8,
+            boxShadow: "0 8px 24px rgba(15,33,56,0.22)",
+            padding: "12px 14px",
+            textAlign: "left",
+            whiteSpace: "normal",
+            wordBreak: "break-word",
+            fontWeight: 400,
+            pointerEvents: "none",
+          }}
+        >
+          <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#6B7785", marginBottom: 2 }}>
+            Product Code
           </div>
-        )}
-      </td>
-      <td className="mr-text-right mr-tabular-nums">
-        {value.toLocaleString()}
-        {allocated < r.requested && allocated > 0 && (
-          <div className="mr-text-xs" style={{ color: "#D69426" }}>
-            Pending Qty: {r.requested - allocated} Pcs
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#0F2138", marginBottom: 10 }}>{code || "—"}</div>
+          <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#6B7785", marginBottom: 2 }}>
+            Product Name
           </div>
-        )}
-        {allocated === 0 && (
-          <div className="mr-text-xs" style={{ color: available === 0 ? "#B23A3A" : "#6B7785" }}>
-            Pending Qty: {r.requested} Pcs
-          </div>
-        )}
-      </td>
-      <td><span className={`tag ${statusTag.cls}`}>{statusTag.label}</span></td>
-      {isSystemAdminRole && (
-        <td style={{ minWidth: 140 }}>
-          <input
-            type="text"
-            placeholder="Add remarks…"
-            className="field mr-text-xs"
-            style={{ width: "100%", padding: "4px 6px" }}
-            value={remarksValue}
-            onChange={(e) => onRemarksChange(e.target.value)}
-            onBlur={onRemarksBlur}
-            disabled={!r.allocationId}
-          />
-        </td>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#0F2138" }}>{name || "—"}</div>
+        </div>
       )}
-      {isSystemAdminRole && (
-        <td className="mr-text-xs mr-whitespace-nowrap">
-          {r.erpStatus === "erp_so_created" ? (
-            <span className="tag tag-approved">ERP SO Created</span>
-          ) : r.status === "approved" ? (
-            <span className="tag tag-pending">Ready for ERP</span>
-          ) : (
-            <span className="tag tag-neutral">Not Transferred</span>
-          )}
-        </td>
-      )}
-      {isSystemAdminRole && (
-        <td>
-          <div className="mr-flex mr-gap-1">
-            <button
-              onClick={onApprove}
-              disabled={!canDecide || busy}
-              title={canDecide ? "Approve" : "Only a Pending row can be actioned"}
-              className="btn btn-primary btn-sm"
-              style={{ padding: "3px 7px" }}
-            >
-              <Check size={12} />
-            </button>
-            <button
-              onClick={onReject}
-              disabled={!canDecide || busy}
-              title={canDecide ? "Reject" : "Only a Pending row can be actioned"}
-              className="btn btn-ghost btn-sm"
-              style={{ padding: "3px 7px", color: "#B23A3A" }}
-            >
-              <X size={12} />
-            </button>
-          </div>
-        </td>
-      )}
-    </tr>
+    </span>
   );
 }
 
-// Allocation Status filter dropdown, embedded directly in the blue table
-// header cell instead of living in the filter bar above the table — same
-// options (All / Pending / Approved / Rejected), same underlying
-// allocStatusFilter state, just relocated so it reads as "filter this
-// column" rather than a generic top-of-page filter. Clicks/changes are
-// stopped from bubbling since some header rows sit inside clickable
-// (expand/collapse) table structures elsewhere on this page.
-function AllocationStatusHeaderFilter({ value, onChange }) {
-  return (
-    <div className="mr-flex-col" style={{ gap: 4, alignItems: "flex-start" }}>
-      <span>Allocation Status</span>
-      <select
-        value={value}
-        onClick={(e) => e.stopPropagation()}
-        onChange={(e) => { e.stopPropagation(); onChange(e.target.value); }}
-        style={{
-          fontSize: 11,
-          fontWeight: 500,
-          textTransform: "none",
-          letterSpacing: "normal",
-          padding: "2px 4px",
-          borderRadius: 4,
-          border: "1px solid rgba(255,255,255,0.35)",
-          background: "rgba(255,255,255,0.08)",
-          color: "#fff",
-          outline: "none",
-          cursor: "pointer",
-        }}
-      >
-        {ALLOCATION_STATUS_OPTIONS.map((o) => (
-          <option key={o.value} value={o.value} style={{ color: "#0F2138" }}>{o.label}</option>
+// ── Shared allocation table row ─────────────────────────────────────────
+function AllocationRow({
+  r, sNo, available, showCatColumn, showProductCols, canManage, inputValue, allocated, shownQty, onAlloc, onAutoAllocate, statusTag,
+  isSystemAdminRole, busy, onApprove, onReject, remarksValue, onRemarksChange, onRemarksBlur,
+  meterValue, onMeterChange,
+  cdFlagValue, onCdFlagChange,
+  priceCodeValue, onPriceCodeChange, priceCodeOptions,
+  showSelection, selected, onToggleSelect,
+  partialOpen, onTogglePartial, colSpan,
+}) {
+  const requestedCap = isSystemAdminRole
+    ? r.requested
+    : Math.max(0, r.requested - r.savedAllocated);
+  const meterMult = numOr1(meterValue);
+  const maxAlloc = Math.min(requestedCap, Math.floor((available + inputValue * meterMult) / meterMult));
+  const canDecide = isSystemAdminRole && r.allocationId && r.status === "pending";
+  const isFullyAllocated = r.requested > 0 && r.savedAllocated >= r.requested;
+  // Locks once Admin has submitted a real saved number; unlocks only if
+  // System Admin rejects it.
+  const isLocked = !isSystemAdminRole
+    && !!r.allocationId
+    && r.savedAllocated > 0
+    && r.status !== 'rejected';
+  const meterLocked = isLocked;
+  // Allocated Mtr can only be typed once an Allocated Qty has been entered.
+  const qtyEntered = Number(inputValue) > 0;
+
+  // Partially allocated order (something saved, something still owed): the row
+  // gets a chevron; opening it shows a second, column-aligned "balance" row
+  // underneath with the REMAINING quantity (48h window from first allocation).
+  const partial = isPartialRow(r);
+  const remaining = Math.max(0, r.requested - r.savedAllocated);
+  const left = partialHoursLeft(r);
+
+  // rem = true renders the "remaining balance" row; false renders the order row.
+  // Only the order (parent) row is orange; the balance row is white.
+  const renderRow = (rem) => {
+    // CD Flag / Price:
+    //  - parent row: editable until it is submitted, read-only (saved values) after
+    //  - balance row: editable (new increment's CD Flag / Price)
+    //  - System Admin: always read-only
+    const cdPriceEditable = canManage && !isSystemAdminRole && (rem ? isLocked : !isLocked);
+    const showSaved = !rem && isLocked;
+    const cdShown = showSaved ? (r.cdFlag || "No") : cdFlagValue;
+    const priceShown = showSaved ? (r.priceListCode || DEFAULT_PRICE_CODE) : priceCodeValue;
+
+    return (
+      <tr className={rem ? "mr-balance-row" : (partial ? "mr-partial-parent" : undefined)}>
+        {showSelection && (
+          rem ? <td></td> : (
+            <td className="mr-text-center">
+              <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`Select allocation row ${r.orderNo}`} />
+            </td>)
+        )}
+        {rem ? <td></td> : (
+          <td className="text-slate mr-text-center">
+            <span className="mr-flex mr-items-center mr-justify-center mr-gap-2">
+              {partial && (
+                <button
+                  type="button" data-no-confirm onClick={onTogglePartial}
+                  title={`${remaining} pending${left !== null ? " · " + fmtLeft(left) : ""} — click to ${partialOpen ? "hide" : "show"}`}
+                  className="mr-product-chevron"
+                  style={{ background: "none", border: "none", cursor: "pointer", padding: 0, color: "#8A5A0E", display: "inline-flex" }}
+                >
+                  {partialOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                </button>
+              )}
+              {sNo != null ? sNo : ""}
+            </span>
+          </td>)}
+        <td className="mr-text-xs mr-font-semibold text-pine mr-whitespace-nowrap mr-text-center">{r.orderNo}</td>
+        <td className="mr-text-xs text-slate mr-whitespace-nowrap mr-text-center">{formatEnquiryDate(r.inquiryDate)}</td>
+        {showProductCols ? (
+          <>
+            <td className="mr-font-medium mr-text-center">{r.customerName}</td>
+            {isSystemAdminRole ? (
+              <td className="mr-text-xs mr-whitespace-nowrap mr-text-center">{r.customerCode}</td>
+            ) : (
+              <>
+                {/* Product Code / Name: first 5 words + "...", full text in the hover card */}
+                <td className="mr-text-xs mr-whitespace-nowrap mr-text-center">
+                  <HoverCard code={r.productCode} name={r.productName}>
+                    {truncateWords(r.productCode)}
+                  </HoverCard>
+                </td>
+                <td className="mr-text-xs mr-text-center">
+                  <HoverCard code={r.productCode} name={r.productName}>
+                    {truncateWords(r.productName)}
+                  </HoverCard>
+                </td>
+              </>
+            )}
+            {showCatColumn && (
+              <td className="mr-whitespace-nowrap mr-text-center"><span className="tag mr-font-semibold" style={{ background: r.group.tagBg, color: r.group.tagText, whiteSpace: "nowrap" }}>{r.group.name}</span></td>
+            )}
+          </>
+        ) : (
+          <>
+            <td className="mr-font-medium mr-text-center">{r.customerName}</td>
+            <td className="mr-text-xs mr-whitespace-nowrap mr-text-center">{r.customerCode}</td>
+            <td></td>
+          </>
+        )}
+        <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{dummyTax(r.key)}</td>
+        <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{dummyPayment(r.key)}</td>
+        <td className="mr-text-center mr-whitespace-nowrap">
+          {!cdPriceEditable ? (
+            <span className="mr-text-xs" style={{ color: cdShown === "Yes" ? "#1C7A4B" : "#6B7785", fontWeight: 600 }}>{cdShown}</span>
+          ) : (
+            <select
+              className="field"
+              value={cdFlagValue}
+              onChange={(e) => onCdFlagChange(e.target.value)}
+              style={{ width: 70, padding: "4px 6px", fontSize: 12, textAlign: "center", fontWeight: 600, color: cdFlagValue === "Yes" ? "#1C7A4B" : "#6B7785" }}
+            >
+              <option value="No">No</option>
+              <option value="Yes">Yes</option>
+            </select>
+          )}
+        </td>
+        <td className="mr-text-center mr-whitespace-nowrap">
+          {!cdPriceEditable ? (
+            <span className="mr-text-xs text-slate">{priceShown || "—"}</span>
+          ) : (
+            <select
+              className="field"
+              value={priceCodeValue}
+              onChange={(e) => onPriceCodeChange(e.target.value)}
+              style={{ width: 92, padding: "4px 6px", fontSize: 12, textAlign: "center" }}
+            >
+              <option value="">—</option>
+              {priceCodeOptions.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          )}
+        </td>
+        {/* Delivery Point: "<number> <name>" from Oracle (dummy only if Oracle has none) */}
+        <td className="mr-text-xs text-slate mr-text-center mr-whitespace-nowrap">{r.deliveryPoint || dummyDeliveryPoint(r.key)}</td>
+        <td className="mr-text-xs text-slate mr-text-center">{r.uom ? uomLabel(r.uom) : "—"}</td>
+        {!showProductCols && showCatColumn && (
+          <td className="mr-whitespace-nowrap mr-text-center"><span className="tag mr-font-semibold" style={{ background: r.group.tagBg, color: r.group.tagText, whiteSpace: "nowrap" }}>{r.group.name}</span></td>
+        )}
+        <td className="mr-font-semibold mr-text-center mr-tabular-nums" style={rem ? { color: "#8A5A0E" } : undefined}>{rem ? remaining : r.requested}</td>
+        {(!showProductCols || !isSystemAdminRole) && (
+          <td className="mr-text-center mr-tabular-nums" style={{ color: stockColor(r.requested, available, allocated) }}>
+            {available}
+          </td>
+        )}
+        {/* Allocated Qty — in the balance row Admin allocates the REMAINING qty
+            here (the box is an increment on top of what's already saved). */}
+        {rem && isSystemAdminRole ? <td className="mr-text-center text-slate">—</td> : (
+          <td className="mr-text-center">
+            {!rem && (isLocked || isSystemAdminRole) ? (
+              <span className="mr-font-semibold mr-tabular-nums" style={{ color: isFullyAllocated ? "#1C7A4B" : undefined }}>
+                {shownQty ?? allocated}
+              </span>
+            ) : (
+              <div className="mr-flex mr-items-center mr-justify-center mr-gap-1">
+                <input
+                  type="number" min={0} max={maxAlloc}
+                  value={inputValue === 0 ? "" : inputValue}
+                  placeholder="0"
+                  disabled={!canManage}
+                  onChange={(e) => onAlloc(e.target.value)}
+                  className="field mr-text-right" style={{ width: 64, padding: "4px 6px" }}
+                />
+                {canManage && (
+                  <button title={`Allocate max (${maxAlloc})`} onClick={onAutoAllocate} className="btn btn-ghost btn-sm" style={{ padding: 4 }}>
+                    <Zap size={12} />
+                  </button>
+                )}
+              </div>
+            )}
+          </td>)}
+
+        {/* Allocated Mtr — the order row shows its own saved Mtr; the balance
+            row is a fresh, empty box (like a new row), not a copy of the parent's.
+            The box only accepts input once an Allocated Qty has been entered.
+            Typed values are capped in Batches (setMeter) so stock never goes below 0. */}
+        {rem && isSystemAdminRole ? <td className="mr-text-center text-slate">—</td> : (
+          <td className="mr-text-center">
+            {!rem && (isSystemAdminRole || meterLocked) ? (
+              <span className="mr-text-xs text-slate">{(isSystemAdminRole ? meterValue : r.meters) || "—"}</span>
+            ) : (
+              <input
+                type="text"
+                placeholder="e.g. 5M"
+                disabled={!canManage}
+                value={meterValue}
+                onFocus={(e) => {
+                  if (!qtyEntered) {
+                    e.target.blur();
+                    window.alert("Enter the Allocated Qty first, then the Allocated Mtr.");
+                  }
+                }}
+                onChange={(e) => { if (qtyEntered) onMeterChange(e.target.value); }}
+                className="field mr-text-center"
+                style={{ width: 76, padding: "4px 6px", textAlign: "center", opacity: qtyEntered ? 1 : 0.6 }}
+              />
+            )}
+          </td>)}
+
+        <td className="mr-text-center">
+          {rem
+            ? <span className="tag tag-pending">{`Pending balance${left !== null ? " · " + fmtLeft(left) : ""}`}</span>
+            : <span className={`tag ${statusTag.cls}`}>{statusTag.label}</span>}
+        </td>
+        {isSystemAdminRole && (rem ? <td></td> : (
+          <td className="mr-text-center" style={{ minWidth: 140 }}>
+            {r.allocationId && r.status !== "pending" ? (
+              <span className="mr-text-xs text-slate">{remarksValue || "—"}</span>
+            ) : (
+              <input
+                type="text"
+                placeholder="Add remarks…"
+                className="field mr-text-xs"
+                style={{ width: "100%", padding: "4px 6px" }}
+                value={remarksValue}
+                onChange={(e) => onRemarksChange(e.target.value)}
+                onBlur={onRemarksBlur}
+                disabled={!r.allocationId}
+              />
+            )}
+          </td>
         ))}
-      </select>
+        {isSystemAdminRole && (rem ? <td></td> : (
+          <td className="mr-text-xs mr-whitespace-nowrap mr-text-center">
+            {r.erpStatus === "erp_so_created" ? (
+              <span className="tag tag-approved">ERP SO Created</span>
+            ) : r.status === "approved" ? (
+              <span className="tag tag-pending">Ready for ERP</span>
+            ) : (
+              <span className="tag tag-neutral">Not Transferred</span>
+            )}
+          </td>
+        ))}
+        {isSystemAdminRole && (rem ? <td></td> : (
+          <td className="mr-text-center">
+            <div className="mr-flex mr-justify-center mr-gap-1">
+              <button
+                onClick={onApprove}
+                data-confirm="Approve this order? It moves on to ERP transfer."
+                data-confirm-title="Approve Order"
+                disabled={!canDecide || busy}
+                title={canDecide ? "Approve" : "Only a Pending row can be actioned"}
+                className="btn btn-primary btn-sm"
+                style={{ padding: "3px 7px" }}
+              >
+                <Check size={12} />
+              </button>
+              <button
+                onClick={onReject}
+                data-confirm="Reject this order? It goes back to Admin."
+                data-confirm-title="Reject Order"
+                disabled={!canDecide || busy}
+                title={canDecide ? "Reject" : "Only a Pending row can be actioned"}
+                className="btn btn-ghost btn-sm"
+                style={{ padding: "3px 7px", color: "#B23A3A" }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          </td>
+        ))}
+      </tr>
+    );
+  };
+
+  return (
+    <>
+      {renderRow(false)}
+      {partial && partialOpen && renderRow(true)}
+    </>
+  );
+}
+
+// ── Autocomplete text input ─────────────────────────────────────────
+function AutocompleteInput({ value, onChange, options, placeholder, inputStyle }) {
+  const [open, setOpen] = useState(false);
+  const filtered = useMemo(() => {
+    const q = value.trim().toLowerCase();
+    if (!q) return [];
+    return options.filter((o) => o.toLowerCase().includes(q)).slice(0, 12);
+  }, [options, value]);
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        type="text"
+        placeholder={placeholder}
+        className="field"
+        style={{ width: "100%", minWidth: 0, boxSizing: "border-box", borderColor: "#9AA7B5", ...inputStyle }}
+        value={value}
+        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => value.trim() && setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && filtered.length > 0 && (
+        <div
+          style={{
+            position: "absolute", top: "calc(100% + 2px)", left: 0, right: 0, zIndex: 30,
+            background: "#fff", border: "1px solid #DBE3EC", borderRadius: 6,
+            maxHeight: 190, overflowY: "auto", boxShadow: "0 6px 16px rgba(15,33,56,0.14)",
+          }}
+        >
+          {filtered.map((opt) => (
+            <div
+              key={opt}
+              onMouseDown={() => { onChange(opt); setOpen(false); }}
+              className="mr-text-xs"
+              style={{ padding: "8px 12px", cursor: "pointer", color: "#0F2138" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "#F1F5F9")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              {opt}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1880,16 +2171,23 @@ function StatCardV2({ icon: Icon, label, value, accent, onViewDetails }) {
   );
 }
 
-function SummaryPanel({ title, rows }) {
+function SummaryBar({ title, rows }) {
   return (
-    <div className="summary-panel">
-      {title && <div className="mr-font-semibold mr-text-sm mr-mb-2 text-pine">{title}</div>}
-      {rows.map((r, i) => (
-        <div className="summary-row" key={i}>
-          <span className="label">{r.label}</span>
-          <span className="value" style={r.color ? { color: r.color } : undefined}>{r.value}</span>
+    <div className="card mr-p-3 mr-mt-4">
+      {title && (
+        <div className="mr-flex mr-items-center mr-gap-2 mr-mb-3">
+          <ShoppingCart size={15} className="text-pine" />
+          <span className="mr-font-semibold mr-text-sm text-pine">{title}</span>
         </div>
-      ))}
+      )}
+      <div className="mr-flex mr-flex-wrap" style={{ gap: 0 }}>
+        {rows.map((r, i) => (
+          <div key={i} style={{ minWidth: 140, padding: "0 24px", marginBottom: 8, borderRight: i < rows.length - 1 ? "1px solid #B7C2CE" : "none" }}>
+            <div className="mr-text-xs text-slate" style={{ marginBottom: 4 }}>{r.label}</div>
+            <div className="mr-font-semibold" style={{ fontSize: 16, color: r.color || undefined }}>{r.value}</div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

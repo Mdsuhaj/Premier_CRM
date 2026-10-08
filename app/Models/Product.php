@@ -4,6 +4,15 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 
+/**
+ * LEGACY / KEPT ON PURPOSE.
+ *
+ * This Products table (and the Orders table) still drive the whole website
+ * and are NOT removed. The client's ERP-format order data is written
+ * ADDITIONALLY to `sale_order_header` / `sale_order_line`
+ * (see App\Services\SaleOrderService and config/sale_order.php), so the
+ * rows can be transferred to the client's ERP without re-mapping.
+ */
 class Product extends Model
 {
     protected $table = 'Products';
@@ -20,7 +29,7 @@ class Product extends Model
     // the columns exist and the controller tries to pass them in, since
     // Eloquent mass-assignment only ever writes $fillable attributes.
     protected $fillable = [
-        'Code', 'SortNo', 'ShadeNo', 'Name', 'Category', 'SubType', 'Color', 'Weight', 'Size',
+        'Code', 'SortNo', 'ShadeNo', 'OrderItemCode', 'Name', 'Category', 'SubType', 'Color', 'Weight', 'Size',
         'Price', 'Quantity', 'Quality', 'Description', 'Status', 'CreatedBy',
     ];
 

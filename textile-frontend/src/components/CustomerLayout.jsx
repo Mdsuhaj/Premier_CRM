@@ -4,6 +4,7 @@
 // Footer as the internal admin Layout for visual consistency, but ships a
 // deliberately small, routed sidebar — Dashboard, Shop, and My Orders are
 // separate pages under /customer/*.
+import { useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import Header from "./Header";
 import Footer from "./Footer";
@@ -11,10 +12,19 @@ import { useTheme } from "../ThemeContext";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-export default function CustomerLayout({ children }) {
+export default function CustomerLayout({ children, pageTitle }) {
   const { colors, isDark } = useTheme();
   const location = useLocation();
   const user = JSON.parse(localStorage.getItem("user") || "{}");
+  // Sidebar open/close toggle — persisted so it stays collapsed/expanded
+  // across page navigations (each page remounts this layout on route change).
+  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("sidebarOpen") !== "false");
+  const toggleSidebar = () => {
+    setSidebarOpen((prev) => {
+      localStorage.setItem("sidebarOpen", String(!prev));
+      return !prev;
+    });
+  };
 
   const isDashboard = location.pathname === "/customer/dashboard";
   const isProductCatalog = location.pathname.startsWith("/customer/catalog");
@@ -23,6 +33,7 @@ export default function CustomerLayout({ children }) {
   const isOrders = location.pathname.startsWith("/customer/orders");
   const isTrackOrders = location.pathname.startsWith("/customer/track");
   const isRaiseComplaint = location.pathname.startsWith("/customer/complaints");
+  const isNotifications = location.pathname.startsWith("/customer/notifications");
 
   const S = buildStyles(colors, isDark);
 
@@ -31,14 +42,15 @@ export default function CustomerLayout({ children }) {
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
       <div style={S.body}>
+
         {/* ── Sidebar (customer-scoped) ── */}
-        <div style={S.sidebar}>
+        <div style={{ ...S.sidebar, width: sidebarOpen ? S.sidebar.width : 0, minWidth: sidebarOpen ? S.sidebar.width : 0, padding: sidebarOpen ? S.sidebar.padding : "20px 0px", overflow: sidebarOpen ? "auto" : "hidden", transition: "width 0.25s ease, min-width 0.25s ease, padding 0.25s ease" }}>
           <div style={S.logoWrap}>
             <span style={S.logoText}>Premier CRM</span>
           </div>
 
           <div style={S.welcomeBadge}>
-             {user.name || user.email || "Customer"}
+            {user.name || user.email || "Customer"}
           </div>
 
           <nav style={S.nav}>
@@ -75,10 +87,16 @@ export default function CustomerLayout({ children }) {
                 <span>My Orders</span>
               </div>
             </Link>
-            <Link to="/customer/track" style={{ textDecoration: "none" }}>
+            {/* <Link to="/customer/track" style={{ textDecoration: "none" }}>
               <div style={{ ...S.navItem, ...(isTrackOrders ? S.navItemActive : {}) }}>
                 <span style={S.navIcon}><CategoryIcon/></span>
                 <span>Tracking</span>
+              </div>
+            </Link> */}
+            <Link to="/customer/notifications" style={{ textDecoration: "none" }}>
+              <div style={{ ...S.navItem, ...(isNotifications ? S.navItemActive : {}) }}>
+                <span style={S.navIcon}><BellNavIcon /></span>
+                <span>Notifications</span>
               </div>
             </Link>
             <Link to="/customer/complaints" style={{ textDecoration: "none" }}>
@@ -96,7 +114,7 @@ export default function CustomerLayout({ children }) {
 
         {/* ── Right: Header + Scrollable Content + Footer ── */}
         <div style={S.rightPane}>
-          <Header />
+          <Header sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} pageTitle={pageTitle} />
           <div style={S.scrollArea}>
             <div style={S.main}>{children}</div>
             <Footer />
@@ -111,7 +129,7 @@ function buildStyles(colors, isDark) {
   return {
     page: {
       display: "flex",
-      height: "100vh",
+      height: "100%",
       overflow: "hidden",
       background: colors.background,
       fontFamily: FONT,
@@ -135,12 +153,12 @@ function buildStyles(colors, isDark) {
       overflowX: "hidden",
     },
     main: {
-      padding: "24px 20px",
+      padding: "12px 20px 24px",
       background: isDark ? colors.background : "#F5F7FA",
       backgroundImage: isDark ? "none" : "radial-gradient(circle at 1px 1px, rgba(15,33,56,0.05) 1px, transparent 0), radial-gradient(1200px 500px at 100% -10%, rgba(31,92,153,0.07), transparent 60%)",
       backgroundSize: "22px 22px, 100% 100%",
       backgroundAttachment: "fixed, fixed",
-      minHeight: "calc(100vh - 62px - 46px)",
+      minHeight: "calc(100% - 46px)",
     },
     sidebar: {
       width: 190,
@@ -237,6 +255,14 @@ function CategoryIcon() {
       <path d="M4 6h16M4 10h16M4 14h8M4 18h8" />
       <circle cx="19" cy="16" r="3" />
       <path d="M19 13v3l2 1" />
+    </svg>
+  );
+}
+function BellNavIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
     </svg>
   );
 }

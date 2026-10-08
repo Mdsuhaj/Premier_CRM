@@ -4,20 +4,18 @@
 // of the customer's /customer/enquiry cart page. Lives at its own route,
 // /end-user/order-cart.
 //
-// Cart table now mirrors the customer-facing Order Enquiry page
-// (src/pages/OrderEnquiry.jsx) exactly: S.No | Sort No | Shade No |
-// Product Name | Type | Qty | UOM | Colour | Actions, with bordered
-// Edit/Done/Remove buttons and a "Total Quantity" footer (flex row,
-// pinned right, page-background shading) below the table instead of an
-// inline table row. Quantity is read-only until the row's Edit is
+// Cart table mirrors the customer-facing Order Enquiry page
+// (src/pages/OrderEnquiry.jsx): bordered Edit/Done/Remove buttons and a
+// "Total Quantity" footer. Quantity is read-only until the row's Edit is
 // pressed; Remove deletes the line.
 //
-// FLOW: "Save as Draft" here writes/updates the draft, empties this
-// customer's cart (clearCart), and hands off to My Drafts — so if the
-// officer comes back to this page later (without a draftId) it starts
-// empty again, same as the very first visit. "Submit Enquiry" behaves
-// the same way it always did: posts the orders, clears the cart, and
-// deletes the draft (if this page was reached by resuming one).
+// FLOW: "Save as Draft" writes/updates the draft, empties this customer's
+// cart (clearCart), and hands off to My Drafts. "Submit Enquiry" posts the
+// orders, clears the cart, and deletes the draft (if resumed from one).
+//
+// CHANGE IN THIS VERSION: Requested Date can't be in the past. The date
+// picker has min = today (local time), submit re-checks it, and an old
+// draft with a past date no longer restores that date.
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import EndUserLayout from "../../components/EndUserLayout";
@@ -26,6 +24,7 @@ import { getG } from "../../theme";
 import API from "../../services/api";
 import { getCart, updateCartQty, removeFromCart, clearCart, subscribeToCart } from "../../utils/endUserCart";
 import { saveDraft, updateDraft, deleteDraft, getDraft } from "../../utils/endUserDrafts";
+import { BRAND } from "../../brand";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -33,10 +32,19 @@ const DUMMY_SWATCHES = ["#8FD9A8", "#7FD1E0", "#E893C9", "#9A9AA5", "#F0A15C", "
 const DUMMY_TYPES = ["BLD & DYED", "Bld/Dyed", "R.Blue/G.Blue", "Fiber Dyed", "YD Dyed", "YD Slub", "3.7 & 7.4", "8*137 (Box)", "Spl Maroon"];
 const DUMMY_SHADE_NOS = ["101", "102", "103", "104", "105", "106"];
 
-function dummyUom(subType) {
-  const u = (subType || "").toLowerCase();
-  if (u.includes("shirting") || u.includes("suiting") || u.includes("blouse")) return "m";
-  return "pcs";
+// Dhoti-family SubTypes use "Border No" instead of "Shade No" — same
+// underlying ShadeNo/Code 8 data, different business term for this one
+// product family. Matches every alias used elsewhere in the project.
+const DHOTI_SUBTYPES = new Set(["Dhoti", "dhoti", "Cotton Dhoti Grey", "cotton dhoti grey", "BO Grey - Dhothies", "Cotton Dhoti Fabric", "cotton dhoti fabric", "BO Fabric - Dhothies"]);
+function shadeOrBorderLabel(subType) {
+  return DHOTI_SUBTYPES.has(subType) ? "Border No" : "Shade No";
+}
+
+// Label-only override — the cart line still stores/sends the real "Meter"
+// value everywhere, only the on-screen text is shortened.
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
 }
 
 function dummyType(product, i) {
@@ -45,16 +53,23 @@ function dummyType(product, i) {
 
 function dummyShadeNo(product, i) {
   const num = product.ShadeNo || DUMMY_SHADE_NOS[i % DUMMY_SHADE_NOS.length];
-  return `SHADE ${num}`;
+  return ` ${num}`;
 }
 
 function dummyDescription(product, i) {
-  return `SHADING FABRIC ${dummyShadeNo(product, i)}`;
+  return ` ${dummyShadeNo(product, i)}`;
 }
 
 function formatDate(d) {
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }).replace(/ /g, "-");
 }
+
+// Today as YYYY-MM-DD in LOCAL time. (toISOString() is UTC, which returns
+// yesterday's date early in the morning in India.)
+const todayLocalISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
 export default function CartCheckout() {
   const { isDark } = useTheme();
@@ -86,8 +101,8 @@ export default function CartCheckout() {
     if (!customerId) { navigate("/end-user/product-selection"); return; }
     (async () => {
       try {
-        const custRes = await API.get("/customers");
-        const found = custRes.data.find((c) => String(c.Id) === String(customerId)) || null;
+        const custRes = await API.get("/customers", { params: { source: "oracle" } });
+        const found = custRes.data.find((c) => String(c.numberid) === String(customerId)) || null;
         setCustomer(found);
       } catch {
         setError("Failed to load customer details.");
@@ -108,7 +123,8 @@ export default function CartCheckout() {
     if (!draftId) return;
     const d = getDraft(draftId);
     if (!d) return;
-    if (d.requestedDate) setRequestedDate(d.requestedDate);
+    // An old draft may hold a date that has since passed — don't restore it.
+    if (d.requestedDate && d.requestedDate >= todayLocalISO()) setRequestedDate(d.requestedDate);
     if (d.refNo) setRefNo(d.refNo);
     if (d.remarks) setRemarks(d.remarks);
   }, [draftId]);
@@ -133,9 +149,7 @@ export default function CartCheckout() {
   };
 
   // Saves/updates the draft, then empties this customer's live cart and
-  // hands off to My Drafts. Coming back to Order Enquiry afterwards
-  // (without a draftId in the URL) starts empty by default, exactly
-  // like a brand-new visit.
+  // hands off to My Drafts.
   const handleSaveDraft = () => {
     if (cart.length === 0) { setError("Your cart is empty — nothing to save as a draft."); return; }
     setError("");
@@ -151,8 +165,8 @@ export default function CartCheckout() {
       } else {
         saveDraft({
           customerId,
-          customerName: customer?.Name,
-          customerCode: customer?.Code,
+          customerName: customer?.shortname,
+          customerCode: customer?.numberid,
           items: cart,
           requestedDate,
           refNo,
@@ -168,22 +182,65 @@ export default function CartCheckout() {
     }
   };
 
+  // Lines are posted in ONE request when every line comes from the Oracle
+  // catalog (POST /orders/cart); otherwise one at a time so two requests
+  // can't race for the same next order code (UQ_Orders_Code).
   const submitEnquiry = async () => {
     if (cart.length === 0) { setError("Your cart is empty."); return; }
     if (!requestedDate) { setError("Please pick a Requested Date."); return; }
+    if (requestedDate < todayLocalISO()) { setError("Requested Date can't be in the past."); return; }
     setSubmitting(true);
     setError("");
     try {
       const notes = buildNotes();
-      await Promise.all(cart.map((l) => API.post("/orders", {
-        customerId,
-        productId: l.product.Id,
-        qty: l.qty,
-        pricePerUnit: l.product.Price,
-        discount: 0,
-        deliveryDate: requestedDate,
-        notes,
-      })));
+      // One ref for the whole cart → all its products become lines of ONE ERP sale-order header.
+      const cartRef = `CART-${Date.now()}-${customerId}`;
+      if (cart.every((l) => l.product.RowKey)) {
+        await API.post("/orders/cart", {
+          oracleCustomerId: String(customerId),
+          deliveryDate: requestedDate,
+          notes,
+          cartRef,
+          items: cart.map((l) => ({
+            oracleProduct: {
+              id: l.product.Id,
+              rowKey: l.product.RowKey,
+              sortNo: l.product.SortNo,
+              shadeNo: l.product.ShadeNo,
+              name: l.product.Name,
+            },
+            qty: l.qty,
+            piecesOfLength: l.piecesOfLength || undefined,
+            uom: l.uom || undefined,
+            remarks: l.remarks || undefined,
+          })),
+        }, { timeout: 180000 });
+      } else {
+        for (const l of cart) {
+          await API.post("/orders", {
+            oracleCustomerId: String(customerId),
+            ...(l.product.RowKey
+              ? {
+                  oracleProduct: {
+                    id: l.product.Id,
+                    rowKey: l.product.RowKey,
+                    sortNo: l.product.SortNo,
+                    shadeNo: l.product.ShadeNo,
+                    name: l.product.Name,
+                  },
+                }
+              : { productId: l.product.Id }), // old cart lines only
+            qty: l.qty,
+            discount: 0,
+            deliveryDate: requestedDate,
+            notes,
+            cartRef,
+            piecesOfLength: l.piecesOfLength || undefined,
+            uom: l.uom || undefined,
+            remarks: l.remarks || undefined,
+          });
+        }
+      }
       clearCart(customerId);
       if (draftId) deleteDraft(draftId);
       navigate("/master/orders", {
@@ -206,9 +263,8 @@ export default function CartCheckout() {
     tableCard: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)", marginBottom: 20 },
     tableScroll: { overflowX: "auto" },
     table: { width: "100%", minWidth: 960, borderCollapse: "collapse" },
-    th: { textAlign: "left", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap" },
-    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap", fontFamily: FONT },
-    tdWrap: { padding: "12px 16px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "normal", maxWidth: 220, fontFamily: FONT },
+    th: { textAlign: "center", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap" },
+    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap", fontFamily: FONT, textAlign: "center" }, tdWrap: { padding: "12px 16px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "normal", maxWidth: 220, fontFamily: FONT, textAlign: "center", },
     swatch: (c) => ({ width: 20, height: 20, borderRadius: "50%", background: c, border: "1.5px solid rgba(0,0,0,0.14)", display: "inline-block", verticalAlign: "middle" }),
     shadeNo: { fontSize: 13, fontWeight: 600, color: themeG.textMain },
 
@@ -217,18 +273,11 @@ export default function CartCheckout() {
     qtyInput: { width: 56, textAlign: "center", padding: "5px 4px", borderRadius: 7, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
     qtyReadOnly: { fontSize: 14, fontWeight: 700, color: themeG.textMain, fontFamily: FONT },
 
-    // Actions column — bordered pill buttons (blue Edit/Done, red
-    // Remove) matching the customer-facing Order Enquiry table, instead
-    // of plain text links.
-    actionsCell: { display: "flex", alignItems: "center", gap: 8 },
+    actionsCell: { display: "flex", alignItems: "center", gap: 8, justifyContent: "center" },
     editBtn: { padding: "6px 14px", borderRadius: 7, border: `1.5px solid ${themeG.accent}`, background: isDark ? "rgba(91,155,217,0.10)" : "#fff", color: themeG.accent, fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
     doneBtn: { padding: "6px 14px", borderRadius: 7, border: "1.5px solid #16A34A", background: isDark ? "rgba(22,163,74,0.10)" : "#fff", color: "#16A34A", fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
     removeBtn: { padding: "6px 14px", borderRadius: 7, border: "1.5px solid #B23A3A", background: isDark ? "rgba(178,58,58,0.10)" : "#fff", color: "#B23A3A", fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
 
-    // Total Quantity footer — matches the customer-facing Order Enquiry
-    // page's own cart footer exactly: a flex row pinned to the right,
-    // shaded with the page background (not the card), small muted label
-    // stacked above a large bold green value, both right-aligned.
     totalBlock: { display: "flex", alignItems: "center", justifyContent: "flex-end", padding: "18px 22px", background: themeG.bg },
     totalLabel: { fontSize: 13, color: themeG.textSub, textAlign: "right", margin: 0 },
     totalValue: { fontSize: 20, fontWeight: 700, color: "#1E9E5A", textAlign: "right", margin: 0 },
@@ -245,7 +294,7 @@ export default function CartCheckout() {
     backBtn: { padding: "10px 20px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: "transparent", color: themeG.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
     actionsRight: { display: "flex", gap: 10 },
     draftBtn: { padding: "10px 22px", borderRadius: 9, border: `1.5px solid ${themeG.accent}`, background: "rgba(91,155,217,0.08)", color: themeG.accent, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
-    finalSubmitBtn: { padding: "10px 26px", borderRadius: 9, border: "none", background: themeG.accent, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
+    finalSubmitBtn: { padding: "10px 26px", borderRadius: 9, border: "none", background: BRAND.green, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
   };
 
   if (loading) {
@@ -274,9 +323,9 @@ export default function CartCheckout() {
       <div style={S.infoCard}>
         <p style={S.infoTitle}>👤 Customer Information</p>
         <div style={S.infoGrid}>
-          <div><p style={S.infoLabel}>Customer Name</p><p style={S.infoValue}>{customer?.Name || "—"}</p></div>
-          <div><p style={S.infoLabel}>Customer Code</p><p style={S.infoValue}>{customer?.Code || "—"}</p></div>
-          <div><p style={S.infoLabel}>Area / Region</p><p style={S.infoValue}>{customer?.Taluk ? `${customer.Taluk} — ${customer.District || ""}` : "—"}</p></div>
+          <div><p style={S.infoLabel}>Customer Name</p><p style={S.infoValue}>{customer?.shortname || "—"}</p></div>
+          <div><p style={S.infoLabel}>Customer Code</p><p style={S.infoValue}>{customer?.numberid || "—"}</p></div>
+          <div> <p style={S.infoLabel}>Area / Region</p> <p style={S.infoValue}> {customer?.town ? `${customer.town} — ${customer.district || ""}` : "—"} </p> </div>
           <div><p style={S.infoLabel}>Sales Officer Name</p><p style={S.infoValue}>{user.name || "—"}</p></div>
           <div><p style={S.infoLabel}>Date</p><p style={S.infoValue}>{formatDate(new Date())}</p></div>
         </div>
@@ -295,12 +344,13 @@ export default function CartCheckout() {
                   <tr>
                     <th style={S.th}>S.No</th>
                     <th style={S.th}>Sort No</th>
-                    <th style={S.th}>Shade No</th>
+                    <th style={S.th}>{
+                      cart.length > 0 && cart.every((l) => DHOTI_SUBTYPES.has(l.product.SubType)) ? "Border No" : "Shade"
+                    }</th>
                     <th style={S.th}>Product Name</th>
-                    <th style={S.th}>Type</th>
-                    <th style={S.th}>Qty</th>
                     <th style={S.th}>UOM</th>
-                    <th style={S.th}>Colour</th>
+                    <th style={S.th}>Quantity</th>
+                    <th style={S.th}>Remarks</th>
                     <th style={S.th}>Actions</th>
                   </tr>
                 </thead>
@@ -312,10 +362,10 @@ export default function CartCheckout() {
                     return (
                       <tr key={l.key}>
                         <td style={S.td}>{i + 1}</td>
-                        <td style={S.td}>{p.Code || "—"}</td>
+                        <td style={S.td}>{p.SortNo || p.Code || "—"}</td>
                         <td style={S.td}><span style={S.shadeNo}>{dummyShadeNo(p, i)}</span></td>
                         <td style={S.tdWrap}>{p.Name || dummyDescription(p, i)}</td>
-                        <td style={S.td}>{dummyType(p, i)}</td>
+                        <td style={S.td}>{uomLabel(l.uom || "Box")}</td>
                         <td style={S.td}>
                           {isEditing ? (
                             <div style={S.qtyBox}>
@@ -340,8 +390,7 @@ export default function CartCheckout() {
                             <span style={S.qtyReadOnly}>{l.qty}</span>
                           )}
                         </td>
-                        <td style={S.td}>{dummyUom(p.SubType)}</td>
-                        <td style={S.td}><div style={S.swatch(swatch)} /></td>
+                        <td style={S.td}>{l.remarks || "—"}</td>
                         <td style={S.td}>
                           <div style={S.actionsCell}>
                             {isEditing ? (
@@ -384,15 +433,15 @@ export default function CartCheckout() {
         <p style={S.detailsTitle}>Additional Details</p>
         <div style={S.detailsGrid}>
           <div>
-            <label style={S.label}>Requested Date *</label>
-            <input type="date" style={S.input} value={requestedDate} onChange={(e) => setRequestedDate(e.target.value)} />
+            <label style={S.label}>Requested Date <span style={{ color: BRAND.red }}>*</span></label>
+            <input type="date" min={todayLocalISO()} style={S.input} value={requestedDate} onChange={(e) => setRequestedDate(e.target.value)} />
           </div>
           <div>
             <label style={S.label}>Reference / PO No.</label>
             <input style={S.input} placeholder="Enter Reference / PO No." value={refNo} onChange={(e) => setRefNo(e.target.value)} />
           </div>
           <div>
-            <label style={S.label}>Remarks</label>
+            <label style={S.label}>Dispatch Instruction</label>
             <textarea
               style={S.textarea}
               placeholder="Enter any additional remarks (if any)"
@@ -414,8 +463,8 @@ export default function CartCheckout() {
           <button style={S.draftBtn} disabled={savingDraft || cart.length === 0} onClick={handleSaveDraft}>
             {savingDraft ? "Saving…" : "💾 Save as Draft"}
           </button>
-          <button style={S.finalSubmitBtn} disabled={submitting || cart.length === 0} onClick={submitEnquiry}>
-            📨 Submit Enquiry
+          <button style={S.finalSubmitBtn} disabled={submitting || cart.length === 0} onClick={submitEnquiry} data-confirm="Submit this enquiry? It will be sent to the Admin for allocation." data-confirm-title="Submit Enquiry">
+            {submitting ? "Submitting…" : "📨 Submit Enquiry"}
           </button>
         </div>
       </div>

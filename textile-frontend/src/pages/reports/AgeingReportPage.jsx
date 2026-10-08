@@ -21,7 +21,7 @@ import { getG } from "../../theme";
 import API from "../../services/api";
 import { exportReportToExcel } from "../../utils/excelIO";
 import {
-  FONT, ExportButton, PageHeading,
+  FONT, ExportButton,
   cardStyle, errorBoxStyle, statCardStyle, todayStamp, fmtAmt,
 } from "./shared";
 
@@ -278,8 +278,7 @@ export default function AgeingReportPage() {
   const tableScroll = { maxHeight: 460, overflowY: "auto", overflowX: "auto" };
 
   return (
-    <Layout pageTitle="Reports">
-      <PageHeading themeG={themeG} title="Ageing Report" subtitle="Overdue balances by customer, product, and product type — bucketed by days overdue." />
+    <Layout pageTitle="Ageing Report">
 
       {loading ? (
         <p style={{ color: themeG.textSub, fontFamily: FONT }}>Loading report…</p>
@@ -345,7 +344,7 @@ export default function AgeingReportPage() {
                 <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900 }}>
                   <thead>
                     <tr>
-                      {["S.No", "Sort No", "Shade No", "Order No", "Customer", "Product Type", "Qty", "Days Overdue", "Bucket", "Total", "Action"].map((h) => (
+                      {["S.No", "Sort No", "Shade", "Enquiry No", "Customer", "Product Type", "Qty", "Days Overdue", "Bucket", "Total", "Action"].map((h) => (
                         <th key={h} style={th}>{h}</th>
                       ))}
                     </tr>

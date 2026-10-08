@@ -42,9 +42,15 @@ const DUMMY_SHADE_NOS = ["101", "102", "103", "104", "105", "106"];
 function dummySortNo(product, i) {
   return product.SortNo || product.Code || String(i + 1).padStart(3, "0");
 }
+// Dhoti-family SubTypes use "Border No" instead of "Shade No" — same
+// underlying ShadeNo/Code 8 data, different business term for this one
+// product family. Prefixing the cell itself (not just the column
+// header) keeps this readable even when the list isn't filtered down
+// to a single SubType.
+const DHOTI_SUBTYPES = new Set(["Dhoti", "dhoti", "Cotton Dhoti Grey", "cotton dhoti grey", "BO Grey - Dhothies", "Cotton Dhoti Fabric", "cotton dhoti fabric", "BO Fabric - Dhothies"]);
 function dummyShadeNo(product, i) {
   const num = product.ShadeNo || DUMMY_SHADE_NOS[i % DUMMY_SHADE_NOS.length];
-  return `SHADE ${num}`;
+  return DHOTI_SUBTYPES.has(product.SubType) ? `BORDER ${num}` : `SHADE ${num}`;
 }
 
 const ColorDot = ({ hex }) => (
@@ -198,10 +204,10 @@ export default function ProductList() {
 
       {/* ── Category badge (locked, no toggle) ── */}
       <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:20 }}>
-        <div style={{ display:"inline-flex", alignItems:"center", gap:8, padding:"8px 18px", borderRadius:10, background:themeG.card, border:`1px solid ${themeG.border}`, boxShadow:"0 2px 8px rgba(46,122,114,0.06)" }}>
+        {/* <div style={{ display:"inline-flex", alignItems:"center", gap:8, padding:"8px 18px", borderRadius:10, background:themeG.card, border:`1px solid ${themeG.border}`, boxShadow:"0 2px 8px rgba(46,122,114,0.06)" }}>
           <span style={{ fontSize:18 }}>{tab === "cloth" ? "👘" : "🧵"}</span>
           <span style={{ fontFamily:FONT, fontSize:14, fontWeight:700, color:themeG.textMain }}>{tab === "cloth" ? "Cloth" : "Yarn"} Products</span>
-        </div>
+        </div> */}
         {/* <span style={{ fontSize:12, color:themeG.textSub, fontFamily:FONT }}>
           <span style={{ color:themeG.accent, cursor:"pointer", textDecoration:"underline" }}
             onClick={() => navigate("/select-category")}>Switch category</span>
@@ -256,7 +262,11 @@ export default function ProductList() {
           </colgroup>
           <thead>
             <tr style={{ borderBottom:`1px solid ${themeG.border}` }}>
-              {["Sort No", "Shade No", "Product Name", "Type", "Color", "Qty", "Status", "Actions"].map((h) => (
+              {[
+                "Sort No",
+                subType !== "All" && DHOTI_SUBTYPES.has(subType) ? "Border No" : "Shade No",
+                "Product Name", "Type", "Color", "Qty", "Status", "Actions",
+              ].map((h) => (
                 <th key={h} style={{ textAlign:"left", fontSize:11, color: "#FFFFFF", background: "#1F3A63", padding:"10px 14px", textTransform:"uppercase", letterSpacing:"0.07em", fontWeight:600, fontFamily:FONT }}>
                   {h}
                 </th>

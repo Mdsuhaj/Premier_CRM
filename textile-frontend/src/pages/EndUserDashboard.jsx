@@ -9,6 +9,7 @@ import EndUserLayout from "../components/EndUserLayout";
 import { useTheme } from "../ThemeContext";
 import { getG, statusColor } from "../theme";
 import API from "../services/api";
+import { Package, Hourglass, CheckCircle2, XCircle } from "lucide-react";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -134,7 +135,7 @@ export default function EndUserDashboard() {
     // at the top always. To also pin against horizontal scroll for the S.No
     // column, we make the first column sticky on the left as well.
     th: {
-      textAlign: "left",
+      textAlign: "center",
       fontSize: 11,
       padding: "10px 12px",
       textTransform: "uppercase",
@@ -147,7 +148,7 @@ export default function EndUserDashboard() {
       zIndex: 2,
     },
     thSno: {
-      textAlign: "left",
+      textAlign: "center",
       fontSize: 11,
       padding: "10px 12px",
       textTransform: "uppercase",
@@ -161,7 +162,7 @@ export default function EndUserDashboard() {
       zIndex: 3,
       width: 56,
     },
-    td: { padding: "12px 12px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` },
+    td: { padding: "12px 12px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center" },
     tdSno: {
       padding: "12px 12px",
       fontSize: 13.5,
@@ -172,6 +173,7 @@ export default function EndUserDashboard() {
       background: themeG.card,
       zIndex: 1,
       fontWeight: 600,
+      textAlign: "center",
     },
     emptyNote: { fontSize: 13, color: themeG.textSub, padding: "14px 0" },
   };
@@ -179,13 +181,13 @@ export default function EndUserDashboard() {
   return (
     <EndUserLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-
+{/* 
       <div style={S.topBar}>
         <div>
           <h1 style={S.heading}>Welcome, {user.name || "End User"}</h1>
           <p style={S.headingSub}>Here's what's happening in your area today.</p>
         </div>
-      </div>
+      </div> */}
 
       {error && (
         <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>
@@ -197,7 +199,7 @@ export default function EndUserDashboard() {
 
         <div style={S.statCard}>
           <div style={{ ...S.cardStripe, background: "#1F5C99" }} />
-          <span style={S.cardIcon}>📦</span>
+          <Package size={20} color="#1F5C99" style={S.cardIcon} />
           <p style={S.cardLabel}>Total Orders</p>
           <p style={S.cardValue}>
             {loading ? "…" : statVal("total_orders")}
@@ -206,7 +208,7 @@ export default function EndUserDashboard() {
 
         <div style={S.statCard}>
           <div style={{ ...S.cardStripe, background: "#D69426" }} />
-          <span style={S.cardIcon}>⏳</span>
+          <Hourglass size={20} color="#D69426" style={S.cardIcon} />
           <p style={S.cardLabel}>Pending Orders</p>
           <p style={S.cardValue}>
             {loading ? "…" : statVal("pending_orders")}
@@ -216,7 +218,7 @@ export default function EndUserDashboard() {
 
         <div style={S.statCard}>
           <div style={{ ...S.cardStripe, background: "#2E8B57" }} />
-          <span style={S.cardIcon}>✅</span>
+          <CheckCircle2 size={20} color="#2E8B57" style={S.cardIcon} />
           <p style={S.cardLabel}>Approved Orders</p>
           <p style={S.cardValue}>
             {loading ? "…" : statVal("approved_orders")}
@@ -225,7 +227,7 @@ export default function EndUserDashboard() {
 
         <div style={S.statCard}>
           <div style={{ ...S.cardStripe, background: "#96302F" }} />
-          <span style={S.cardIcon}>❌</span>
+          <XCircle size={20} color="#96302F" style={S.cardIcon} />
           <p style={S.cardLabel}>Rejected Orders</p>
           <p style={S.cardValue}>
             {loading ? "…" : statVal("rejected_orders")}
@@ -256,10 +258,11 @@ export default function EndUserDashboard() {
               <thead>
                 <tr>
                   <th style={S.thSno}>S.No</th>
-                  <th style={S.th}>Order</th>
+                  <th style={S.th}>Enquiry No</th>
+                  <th style={S.th}>Enquiry Date</th>
                   <th style={S.th}>Customer</th>
                   <th style={S.th}>Product</th>
-                  <th style={S.th}>Amount</th>
+                  <th style={S.th}>Quantity</th>
                   <th style={S.th}>Status</th>
                 </tr>
               </thead>
@@ -268,9 +271,10 @@ export default function EndUserDashboard() {
                   <tr key={o.id}>
                     <td style={S.tdSno}>{idx + 1}</td>
                     <td style={S.td}>{o.id}</td>
+                    <td style={S.td}>{o.date ? String(o.date).substring(0, 10) : "—"}</td>
                     <td style={S.td}>{o.customer}</td>
                     <td style={S.td}>{o.product}</td>
-                    <td style={S.td}>{formatRevenue(parseFloat(o.amount) || 0)}</td>
+                    <td style={S.td}>{o.quantity ?? "—"}</td>
                     <td style={S.td}><Badge text={o.status} /></td>
                   </tr>
                 ))}

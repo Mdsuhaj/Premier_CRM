@@ -41,7 +41,7 @@ import {
 } from "lucide-react";
 import Layout from "../../components/AppLayout";
 import API from "../../services/api";
-import { SectionTitle, StatCardV2, EmptyState } from "../../components/reviewUiKit";
+import { StatCardV2, EmptyState } from "../../components/reviewUiKit";
 import { COMPLAINT_TYPES } from "../../utils/complaintTypes";
 
 const INK = "#0F2138";
@@ -244,14 +244,6 @@ export default function ComplaintsAndClaims() {
   return (
     <Layout pageTitle="Complaints & Claims">
       <div className="font-body">
-        <div className="flex items-end justify-between gap-3 mb-5 flex-wrap">
-          <SectionTitle
-            eyebrow="Customer Service"
-            title="Complaints & Claims"
-            desc="Track every complaint from registration through investigation, decision, and customer feedback."
-          />
-        </div>
-
         {error && (
           <div className="mb-4 rounded-lg border px-3.5 py-2.5 text-sm" style={{ background: "rgba(178,58,58,0.08)", borderColor: "rgba(178,58,58,0.25)", color: CLAY }}>
             {error}

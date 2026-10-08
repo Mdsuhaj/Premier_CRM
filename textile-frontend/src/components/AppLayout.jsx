@@ -12,7 +12,7 @@ export default function AppLayout({ children, ...props }) {
   const role = localStorage.getItem("role");
 
   if (role === "end_user") {
-    return <EndUserLayout>{children}</EndUserLayout>;
+    return <EndUserLayout pageTitle={props.pageTitle}>{children}</EndUserLayout>;
   }
 
   return <Layout {...props}>{children}</Layout>;

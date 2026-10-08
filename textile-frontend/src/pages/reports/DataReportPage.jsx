@@ -12,7 +12,7 @@ import { getG, statusColor } from "../../theme";
 import API from "../../services/api";
 import { exportReportToExcel } from "../../utils/excelIO";
 import {
-  FONT, ListBox, ExportButton, PageHeading,
+  FONT, ListBox, ExportButton,
   cardStyle, cardTitleStyle, errorBoxStyle, statCardStyle, groupBy, fmtDate, todayStamp,
 } from "./shared";
 
@@ -347,8 +347,7 @@ export default function DataReportPage() {
   });
 
   return (
-    <Layout pageTitle="Reports">
-      <PageHeading themeG={themeG} title="Data Report" subtitle="Products, Orders, and Employees — the underlying master data — in one place." />
+    <Layout pageTitle="Data Report">
 
       <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
         {[["products", "Products"], ["orders", "Orders"], ["employees", "Employees"]].map(([key, label]) => (

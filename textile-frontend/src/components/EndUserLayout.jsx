@@ -43,7 +43,7 @@ import { useTheme } from "../ThemeContext";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-export default function EndUserLayout({ children }) {
+export default function EndUserLayout({ children, pageTitle }) {
   const { colors, isDark } = useTheme();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -62,6 +62,7 @@ export default function EndUserLayout({ children }) {
   const isCartCheckout = location.pathname === "/end-user/order-cart";
   const isDrafts = location.pathname === "/end-user/drafts";
   const isComplaints = location.pathname.startsWith("/end-user/complaints");
+  const isNotifications = location.pathname.startsWith("/end-user/notifications");
   const isAddCustomer = location.pathname === "/end-user/customers/add";
   const isCustomerList = location.pathname === "/end-user/customers";
 
@@ -70,6 +71,15 @@ export default function EndUserLayout({ children }) {
   // lives outside this group as its own top-level link (see nav below).
   const [enquiryOpen, setEnquiryOpen] = useState(isEnquiry || isDrafts || isCartCheckout || isOrdersPage);
   const [customersOpen, setCustomersOpen] = useState(isAddCustomer || isCustomerList);
+  // Sidebar open/close toggle — persisted so it stays collapsed/expanded
+  // across page navigations (each page remounts this layout on route change).
+  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("sidebarOpen") !== "false");
+  const toggleSidebar = () => {
+    setSidebarOpen((prev) => {
+      localStorage.setItem("sidebarOpen", String(!prev));
+      return !prev;
+    });
+  };
 
   const S = buildStyles(colors, isDark);
 
@@ -78,22 +88,23 @@ export default function EndUserLayout({ children }) {
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
       <div style={S.body}>
+
         {/* ── Sidebar (end_user / area-scoped) ── */}
-        <div style={S.sidebar}>
+        <div style={{ ...S.sidebar, width: sidebarOpen ? S.sidebar.width : 0, minWidth: sidebarOpen ? S.sidebar.width : 0, padding: sidebarOpen ? S.sidebar.padding : "20px 0px", overflow: sidebarOpen ? "auto" : "hidden", transition: "width 0.25s ease, min-width 0.25s ease, padding 0.25s ease" }}>
           <div style={S.logoWrap}>
             <span style={S.logoText}>Premier CRM</span>
           </div>
 
-          <div style={S.welcomeBadge}>
+          {/* <div style={S.welcomeBadge}>
              {user.name || user.email || "End User"}
-          </div>
+          </div> */}
 
-          {taluks.length > 0 && (
+          {/* {taluks.length > 0 && (
             <div style={S.areaBadge}>
                {taluks.join(", ")}
               <span style={{ opacity: 0.6 }}> (Taluk)</span>
             </div>
-          )}
+          )} */}
 
           <nav style={S.nav}>
             <Link to="/end-user/dashboard" style={{ textDecoration: "none" }}>
@@ -110,7 +121,7 @@ export default function EndUserLayout({ children }) {
               </div>
             </Link>
 
-            <div style={S.navGroup}>
+            {/* <div style={S.navGroup}>
               <div style={S.navGroupHeader} onClick={() => setCustomersOpen(!customersOpen)}>
                 <span style={S.navIcon}><UsersIcon /></span>
                 <span style={S.navGroupLabel}>Customers</span>
@@ -122,7 +133,7 @@ export default function EndUserLayout({ children }) {
                   <NavLeaf to="/end-user/customers" label="Customer List" active={isCustomerList} S={S} />
                 </div>
               )}
-            </div>
+            </div> */}
 
             <div style={S.navGroup}>
               <div style={S.navGroupHeader} onClick={() => setEnquiryOpen(!enquiryOpen)}>
@@ -139,6 +150,13 @@ export default function EndUserLayout({ children }) {
               )}
             </div>
 
+            <Link to="/end-user/notifications" style={{ textDecoration: "none" }}>
+              <div style={{ ...S.navItem, ...(isNotifications ? S.navItemActive : {}) }}>
+                <span style={S.navIcon}><BellNavIcon /></span>
+                <span>Notifications</span>
+              </div>
+            </Link>
+
             <Link to="/end-user/complaints" style={{ textDecoration: "none" }}>
               <div style={{ ...S.navItem, ...(isComplaints ? S.navItemActive : {}) }}>
                 <span style={S.navIcon}><ChartIcon /></span>
@@ -154,7 +172,7 @@ export default function EndUserLayout({ children }) {
 
         {/* ── Right: Header + Scrollable Content + Footer ── */}
         <div style={S.rightPane}>
-          <Header />
+          <Header sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} pageTitle={pageTitle} />
           <div style={S.scrollArea}>
             <div style={S.main}>{children}</div>
             <Footer />
@@ -193,7 +211,7 @@ function buildStyles(colors, isDark) {
   return {
     page: {
       display: "flex",
-      height: "100vh",
+      height: "100%",
       overflow: "hidden",
       background: colors.background,
       fontFamily: FONT,
@@ -217,12 +235,12 @@ function buildStyles(colors, isDark) {
       overflowX: "hidden",
     },
     main: {
-      padding: "24px 20px",
+      padding: "12px 20px 24px",
       background: isDark ? colors.background : "#F5F7FA",
       backgroundImage: isDark ? "none" : "radial-gradient(circle at 1px 1px, rgba(15,33,56,0.05) 1px, transparent 0), radial-gradient(1200px 500px at 100% -10%, rgba(31,92,153,0.07), transparent 60%)",
       backgroundSize: "22px 22px, 100% 100%",
       backgroundAttachment: "fixed, fixed",
-      minHeight: "calc(100vh - 62px - 46px)",
+      minHeight: "calc(100% - 46px)",
     },
     sidebar: {
       width: 200,
@@ -361,6 +379,14 @@ function UsersIcon() {
       <circle cx="9" cy="7" r="4" />
       <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
       <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+function BellNavIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
     </svg>
   );
 }

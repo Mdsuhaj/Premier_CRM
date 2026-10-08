@@ -8,7 +8,7 @@ import { getG } from "../../theme";
 import API from "../../services/api";
 import { exportReportToExcel } from "../../utils/excelIO";
 import {
-  FONT, ExportButton, PageHeading,
+  FONT, ExportButton,
   cardStyle, errorBoxStyle, statCardStyle, todayStamp, fmtAmt,
 } from "./shared";
 
@@ -79,8 +79,7 @@ export default function OverdueReportPage() {
   const td = { padding: "10px 12px", fontSize: 13, color: themeG.textMain };
 
   return (
-    <Layout pageTitle="Reports">
-      <PageHeading themeG={themeG} title="Overdue Report" subtitle="Same data that powers the Credit Limit page, presented as a report." />
+    <Layout pageTitle="Overdue Report">
 
       {loading ? (
         <p style={{ color: themeG.textSub, fontFamily: FONT }}>Loading report…</p>

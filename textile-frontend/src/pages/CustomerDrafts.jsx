@@ -76,8 +76,6 @@ export default function CustomerDrafts() {
   return (
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-      <p style={S.heading}>📑 Drafts</p>
-      <p style={S.sub}>Enquiries you started but haven't submitted yet. Resume one to pick up where you left off.</p>
 
       {drafts.length === 0 ? (
         <div style={S.empty}>No drafts saved yet. Save one from Product Selection and it'll show up here.</div>

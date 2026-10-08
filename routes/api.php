@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\CustomerController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\OrderController;
 use App\Http\Controllers\Api\EmployeeController;
+use App\Http\Controllers\Api\UserController;
 use App\Http\Controllers\Api\LocationController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\ComplaintController;
@@ -12,6 +13,7 @@ use App\Http\Controllers\Api\AllocationController;
 use App\Http\Controllers\Api\BatchController;
 use App\Http\Controllers\Api\InvoiceController;
 use App\Http\Controllers\Api\NotificationController;
+use App\Http\Controllers\Api\SaleOrderController;
 
 Route::post('/login', [AuthController::class, 'login']);
 
@@ -25,7 +27,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/dashboard/compliance', [DashboardController::class, 'compliance']);
 
     Route::post('/orders/bulk', [OrderController::class, 'storeBulk']);
+    Route::post('/orders/cart', [OrderController::class, 'storeCart']);
+    Route::patch('/orders/close', [OrderController::class, 'close']);
     Route::apiResource('customers', CustomerController::class);
+    Route::get('/products/available-stock-summary', [ProductController::class, 'availableStockSummary']);
+    Route::get('/products/available-stock', [ProductController::class, 'availableStock']);
     Route::apiResource('products',  ProductController::class);
     Route::apiResource('orders',    OrderController::class);
 
@@ -43,6 +49,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/allocations/customers',   [AllocationController::class, 'customers']);
     Route::get('/allocations/by-customer', [AllocationController::class, 'byCustomer']);
     Route::post('/allocations/by-customer',[AllocationController::class, 'storeByCustomer']);
+    Route::get('/allocations/price-list-options', [AllocationController::class, 'priceListOptions']);
     // Single combined call for the whole Marketing Review board — every
     // product with active demand plus its full per-customer breakdown, in
     // one round trip. Replaces the old GET /allocations/products followed
@@ -60,6 +67,14 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/allocations/bulk-decision',     [AllocationController::class, 'bulkDecision']);
     Route::post('/allocations/{id}/erp-transfer', [AllocationController::class, 'erpTransfer']);
     Route::post('/allocations/bulk-erp-transfer', [AllocationController::class, 'bulkErpTransfer']);
+
+    // ERP staging tables — sale_order_header (1 per order) + sale_order_line
+    // (1 per product). Written automatically when an order is placed;
+    // these endpoints are read-only (list, detail, per-order preview, Excel export).
+    Route::get('/sale-orders/export',  [SaleOrderController::class, 'export']);
+    Route::get('/sale-orders',         [SaleOrderController::class, 'index']);
+    Route::get('/sale-orders/{id}',    [SaleOrderController::class, 'show']);
+    Route::get('/erp-export/{orderId}',[SaleOrderController::class, 'byOrder']);
 
     // Stock batches (FIFO lots) — Rack (Blouse) vs EB4 Dispatch Warehouse.
     Route::get('/batches',  [BatchController::class, 'index']);
@@ -92,6 +107,15 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/employees',         [EmployeeController::class, 'store']);
     Route::put('/employees/{id}',     [EmployeeController::class, 'update']);
     Route::patch('/employees/{id}',   [EmployeeController::class, 'update']);
+
+    // Admin Master — Super Admin account provisioning for end_user / admin /
+    // system_admin logins (direct create with password, no approval step).
+    Route::get('/accounts',           [UserController::class, 'index']);
+    Route::get('/accounts/{id}',      [UserController::class, 'show']);
+    Route::post('/accounts',          [UserController::class, 'store']);
+    Route::put('/accounts/{id}',      [UserController::class, 'update']);
+    Route::patch('/accounts/{id}',    [UserController::class, 'update']);
+    Route::delete('/accounts/{id}',   [UserController::class, 'destroy']);
 
     // Tamil Nadu district / taluk reference data — used for District
     // assignment (System Admin → Admin) and Taluk assignment (Admin → End User)

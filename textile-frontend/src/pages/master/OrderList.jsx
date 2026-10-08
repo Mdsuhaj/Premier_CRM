@@ -2,90 +2,55 @@
 //
 // Orders hub.
 //
-// Tabs shown depend on role:
-//   - admin / system_admin : "Order List" + "Order Status" (unchanged
-//                             from before — full CRUD list, and the
-//                             approve/decline/process/dispatch/deliver
-//                             workflow). Still an in-page toggle, same
-//                             as always.
-//   - end_user              : NO in-page toggle anymore. My Orders and
-//                             Customer Orders are now two separate
-//                             sidebar links (EndUserLayout.jsx) —
-//                             "My Orders" -> /master/orders
-//                             "Customer Orders" -> /master/orders?tab=customer
-//                             This page just reads that `tab` query
-//                             param and renders the one matching list.
-//                             Both use the same underlying table/filters
-//                             as admin's "Order List" (search, status
-//                             pills, Excel export/import, view/edit/
-//                             delete), just pre-split by who placed the
-//                             order:
-//                               - My Orders       -> placed by the end
-//                                                    user themself
-//                               - Customer Orders -> placed by one of
-//                                                    their own customers
-//                                                    directly
+//   - admin / system_admin : ONE page — "Order List".
+//       * Status pills are replaced by a single dropdown:
+//           Pending Allocation | Partial Allocation | Fully Allocated |
+//           Approved | ERP Transfer | Sale Loss | Reject
+//         The first five are filters and come from REAL data (GET /allocations/board).
+//         "Sale Loss" and "Reject" are NOT filters — picking one opens their own
+//         separate pages (SaleLossList.jsx / RejectedList.jsx).
+//         Orders whose status is Sale Loss / Rejected are hidden from this list.
+//       * Actions column = only 2 icons:
+//           ☰  -> popover: View · Edit (+ Edit Allocation for ADMIN on PARTIAL orders only)
+//           🗑  delete
 //
-// End-user status pills (both My Orders + Customer Orders):
-//   All | Pending | Approved | Rejected
-//   ("Rejected" is the UI label for backend status "declined".)
+//   - end_user : My Orders / Customer Orders are separate sidebar links
+//       (?tab=customer). They use the SAME status dropdown as Admin (All Status,
+//       Pending Allocation ... Reject), but only over the end user's own orders.
+//       Actions stay as the 3 buttons (view / edit / delete).
 //
-// Order List visibility by role (backend scope, unchanged):
-//   - system_admin : sees every order, regardless of who it's assigned to
-//   - admin        : sees their own orders + orders assigned to end users
-//                     under them (backend scope="own_and_team")
-//   - end_user     : sees only their own orders (backend scope="own")
+// Allocation stage of an order (admin / system_admin view), first match wins:
+//   nothing allocated (or allocation rejected) -> Pending Allocation
+//   allocated < ordered                        -> Partial Allocation
+//   ERP SO created                             -> ERP Transfer
+//   System Admin approved                      -> Approved
+//   otherwise (submitted, awaiting approval)   -> Fully Allocated
 //
-// NOTE (added): now also shows a one-time success banner when arriving
-// here via CartCheckout.jsx's navigate("/master/orders", { state: { notice } }),
-// after a Field Officer submits a cart. Everything else below is
-// unchanged from the existing file.
-//
-// My Orders vs Customer Orders split:
-// Orders.CreatedBy already exists in the DB and is already set correctly
-// by OrderController@store (staff-placed) and @storeBulk (customer cart
-// checkout) — so every order already knows who placed it. The only
-// backend change needed is adding 'creator' to the eager load on
-// GET /orders and GET /orders/{id} (Order::with([...,'creator'])) so
-// o.creator.role / o.CreatedBy actually show up in the API response.
-//
-// detectPlacement() below reads o.creator.role (preferred) or falls
-// back to comparing o.CreatedBy against the current user's id. If
-// neither is present in the response yet (backend hasn't added the
-// eager load), it returns "unknown" and "Customer Orders" shows an
-// explanatory empty state instead of guessing.
-//
-// FIX (placement misclassification): the role check against
-// o.creator.role was a strict `=== "customer"` comparison. If the
-// backend sends the role in any other casing/shape (e.g. "Customer",
-// "CUSTOMER", or with stray whitespace), every order silently fell
-// through to "mine" — which is exactly the "everything lands in My
-// Orders" symptom. Now normalized (trimmed + lowercased) before
-// comparing, and matched against a small set of known "customer-ish"
-// values instead of a single exact string, so backend inconsistencies
-// don't misroute orders.
-//
-// TABLE REDESIGN (latest): columns reordered to
-//   S.No | Order No | Date | Customer Name | Sub Type | Product Name |
-//   Qty | Following Person | Delivery Date | Status | Actions
-// "Order ID" is now labelled "Order No" (same underlying value, o.Code —
-// just a clearer header). Sub Type and Product Name are pulled from real
-// data: Sub Type is already the order's own o.SubType; Product Name is
-// newly resolved below via o.product?.Name (if the backend eager-loads
-// it) falling back to a lookup against the already-fetched /products
-// list by o.ProductId — no placeholder/dummy values used for either.
+// ── CHANGES IN THIS VERSION ──
+// 1. The summary cards now carry an icon + coloured top border, like the dashboard.
+// 2. "All Sub Types" always lists Blouse, Dhoti, Uniform Shirting and Uniform Suiting
+//    (cloth), even when no order exists yet for a sub type.
 import { useTheme } from "../../ThemeContext";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate, useLocation, useSearchParams } from "react-router-dom";
+import { Menu, Trash2, Eye, Pencil, ClipboardCheck, Package, Hourglass, PackageCheck, CheckCircle2 } from "lucide-react";
 import Layout from "../../components/AppLayout";
 import { getG, statusColor } from "../../theme";
 import API from "../../services/api";
 import ExcelToolbar from "../../components/ExcelToolbar";
+import { SALE_LOSS_PATH, REJECT_PATH, isSaleLossStatus, isRejectedStatus } from "../../utils/orderStatus";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-// Excel export/import columns — kept in the same order as the on-screen
-// table (minus S.No/Actions, which aren't meaningful in a spreadsheet).
+// Route of Batches.jsx (Marketing Review). Change if your router uses a different path.
+const BATCHES_PATH = "/master/batches";
+const PARTIAL_WINDOW_HOURS = 48;
+// Only ADMIN gets "Edit Allocation" — and only on PARTIAL allocation orders.
+const ALLOCATE_ROLES = ["admin"];
+
+// Excel export/import columns — same order as the on-screen table
+// (minus S.No/Actions, which aren't meaningful in a spreadsheet).
 const ORDER_EXCEL_COLUMNS = [
   { key: "id", header: "Order No" },
   { key: "date", header: "Date" },
@@ -97,12 +62,26 @@ const ORDER_EXCEL_COLUMNS = [
   { key: "deliveryDate", header: "Expected Delivery Date" },
   { key: "status", header: "Status" },
 ];
+// Admin / System Admin export the allocation stage instead of the raw order status.
+const ORDER_EXCEL_COLUMNS_ADMIN = ORDER_EXCEL_COLUMNS.map((c) =>
+  c.key === "status" ? { key: "stageLabel", header: "Allocation Status" } : c
+);
 
-// End-user lists: only these 4. "Rejected" is UI-only; backend status is "declined".
-const STATUS_FILTERS_END_USER = ["All", "Pending", "Approved", "Rejected"];
-const STATUS_FILTERS_ADMIN = ["All", "Approved", "Pending", "Processing", "Delivered", "Declined"];
+// Admin / System Admin allocation-stage dropdown (real filters).
+const STAGE_META = {
+  pending_allocation: { label: "Pending Allocation", color: "#D69426" },
+  partial_allocation: { label: "Partial Allocation", color: "#C2571A" },
+  fully_allocated: { label: "Fully Allocated", color: "#2E6B9E" },
+  approved: { label: "Approved", color: "#1C7A4B" },
+  erp_transfer: { label: "ERP Transfer", color: "#5B4B8C" },
+};
+const STAGE_OPTIONS = Object.entries(STAGE_META).map(([value, m]) => ({ value, label: m.label }));
 
-/** Map UI filter label → backend status string(s) to match. */
+// Dropdown entries that open another page instead of filtering.
+const NAV_OPTION_SALE_LOSS = "__sale_loss__";
+const NAV_OPTION_REJECT = "__reject__";
+
+/** Map UI filter label → backend status string(s) to match (end-user pills). */
 function statusMatchesFilter(orderStatus, filterStatus) {
   if (filterStatus === "All") return true;
   const s = (orderStatus || "").toLowerCase();
@@ -118,6 +97,19 @@ function displayStatus(status, preferRejected) {
   return status || "";
 }
 
+// Label-only override used across the app — "Meter" is stored as before,
+// only shown as "Mtr" (and Box as "Cases").
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
+}
+
+const hoursSince = (iso) => {
+  if (!iso) return null;
+  const t = new Date(String(iso).replace(" ", "T")).getTime();
+  return isNaN(t) ? null : (Date.now() - t) / 36e5;
+};
+
 const categoryColors = {
   yarn: { bg: "rgba(247,232,203,0.22)", dot: "#D69426", border: "rgba(214,148,38,0.22)" },
   cloth: { bg: "rgba(216,230,243,0.22)", dot: "#5B9BD9", border: "rgba(91,155,217,0.20)" },
@@ -132,11 +124,101 @@ const Badge = ({ text, colorFn }) => {
   );
 };
 
+const StageBadge = ({ stage }) => {
+  const m = STAGE_META[stage] || STAGE_META.pending_allocation;
+  return (
+    <span style={{ background: `${m.color}18`, color: m.color, border: `1px solid ${m.color}40`, padding: "3px 11px", borderRadius: 20, fontSize: 12, fontWeight: 600, fontFamily: FONT, whiteSpace: "nowrap" }}>
+      {m.label}
+    </span>
+  );
+};
+
 const btnStyle = (color) => ({ padding: "5px 13px", borderRadius: 7, border: `1px solid ${color}40`, background: `${color}14`, color, cursor: "pointer", fontSize: 12, fontFamily: FONT, fontWeight: 600, whiteSpace: "nowrap" });
-const actionBtn = (bg, color, border) => ({
-  padding: "7px 14px", borderRadius: 8, border: `1px solid ${border}`, background: bg, color,
-  cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
-});
+const iconBtnStyle = (color) => ({ ...btnStyle(color), display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "6px 11px" });
+
+/* ─────────── Popover card opened by the 3-line icon (Instagram-style) ─────────── */
+function ActionMenu({ themeG, title, items }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+  const btnRef = useRef(null);
+  const menuRef = useRef(null);
+
+  const MENU_W = 190;
+
+  const toggle = () => {
+    if (!open && btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect();
+      const menuH = 34 + items.length * 44 + 10;
+      const below = window.innerHeight - r.bottom;
+      const top = below < menuH + 12 ? Math.max(8, r.top - menuH - 6) : r.bottom + 6;
+      setPos({ top, left: Math.max(8, Math.min(r.right - MENU_W, window.innerWidth - MENU_W - 8)) });
+    }
+    setOpen((o) => !o);
+  };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => {
+      if (menuRef.current?.contains(e.target) || btnRef.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    const close = () => setOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [open]);
+
+  return (
+    <>
+      <button ref={btnRef} type="button" aria-label="Order actions" aria-haspopup="menu" aria-expanded={open}
+        style={iconBtnStyle(themeG.accent)} onClick={toggle}>
+        <Menu size={15} />
+      </button>
+      {open && createPortal(
+        <div ref={menuRef} role="menu"
+          style={{
+            position: "fixed", top: pos.top, left: pos.left, width: MENU_W, zIndex: 2000,
+            background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14,
+            boxShadow: "0 12px 32px rgba(15,33,56,0.22)", padding: 6, fontFamily: FONT,
+          }}>
+          <div style={{ padding: "8px 12px 6px", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: themeG.textLabel, borderBottom: `1px solid ${themeG.border}`, marginBottom: 4 }}>
+            {title}
+          </div>
+          {items.map((it) => {
+            const Icon = it.icon;
+            return (
+              <button key={it.key} type="button" role="menuitem" disabled={it.disabled}
+                onClick={() => { setOpen(false); it.onClick(); }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left",
+                  padding: "9px 12px", borderRadius: 9, border: "none", background: "transparent",
+                  color: it.disabled ? themeG.textSub : themeG.textMain, opacity: it.disabled ? 0.55 : 1,
+                  cursor: it.disabled ? "not-allowed" : "pointer", fontFamily: FONT, fontSize: 13.5, fontWeight: 600,
+                }}
+                onMouseEnter={(e) => { if (!it.disabled) e.currentTarget.style.background = "rgba(91,155,217,0.12)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}>
+                <Icon size={16} color={it.color || themeG.accent} />
+                <span style={{ display: "flex", flexDirection: "column", lineHeight: 1.25 }}>
+                  {it.label}
+                  {it.hint && <span style={{ fontSize: 11, fontWeight: 500, color: themeG.textSub }}>{it.hint}</span>}
+                </span>
+              </button>
+            );
+          })}
+        </div>,
+        document.body
+      )}
+    </>
+  );
+}
 
 export default function OrderList() {
   const { isDark } = useTheme();
@@ -149,7 +231,11 @@ export default function OrderList() {
   const isEndUser = role === "end_user";
   const notice = location.state?.notice || "";
 
-  const [tab, setTab] = useState("list");
+  const noticeBox = notice && (
+    <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent, fontFamily: FONT }}>
+      {notice}
+    </div>
+  );
 
   // ── end_user: no in-page toggle ──
   // My Orders      -> /master/orders            (placed by this FO)
@@ -160,71 +246,36 @@ export default function OrderList() {
 
     return (
       <Layout pageTitle={pageTitle}>
-        {notice && (
-          <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent, fontFamily: FONT }}>
-            {notice}
-          </div>
-        )}
+        {noticeBox}
         <OrderListTab
           themeG={themeG}
           navigate={navigate}
           placementFilter={placementFilter}
-          statusFilters={STATUS_FILTERS_END_USER}
           preferRejectedLabel
         />
       </Layout>
     );
   }
 
-  // ── admin / system_admin: unchanged "Order List" + "Order Status" toggle ──
-  const tabsConfig = [
-    { key: "list", label: "Order List" },
-    { key: "status", label: "Order Status" },
-  ];
-
-  const tabBtn = (key, label) => (
-    <button
-      key={key}
-      onClick={() => setTab(key)}
-      style={{
-        padding: "9px 20px", borderRadius: 9, border: "none", cursor: "pointer",
-        fontFamily: FONT, fontSize: 13.5, fontWeight: 700,
-        background: tab === key ? themeG.accent : "transparent",
-        color: tab === key ? "#fff" : themeG.textSub,
-      }}
-    >
-      {label}
-    </button>
-  );
-
+  // ── admin / system_admin: a single "Order List" page ──
   return (
-    <Layout pageTitle="Orders">
-      {notice && (
-        <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent, fontFamily: FONT }}>
-          {notice}
-        </div>
-      )}
-
-      <div style={{ display: "inline-flex", background: themeG.bg, border: `1px solid ${themeG.border}`, borderRadius: 11, padding: 3, marginBottom: 22 }}>
-        {tabsConfig.map((t) => tabBtn(t.key, t.label))}
-      </div>
-
-      {tab === "list" && (
-        <OrderListTab
-          themeG={themeG}
-          navigate={navigate}
-          placementFilter="all"
-          statusFilters={STATUS_FILTERS_ADMIN}
-        />
-      )}
-      {tab === "status" && <OrderStatusTab themeG={themeG} navigate={navigate} />}
+    <Layout pageTitle="Order List">
+      {noticeBox}
+      {/* <h2 style={{ margin: "0 0 18px", fontFamily: FONT, fontSize: 20, fontWeight: 700, color: themeG.textMain }}>
+        Order List
+      </h2> */}
+      <OrderListTab themeG={themeG} navigate={navigate} placementFilter="all" adminMode />
     </Layout>
   );
 }
 
-/* ────────────────────────── Tab: Order List / My Orders / Customer Orders ──────────────────────────── */
+/* ────────────────────────── Order List / My Orders / Customer Orders ──────────────────────────── */
 
 const CUSTOMER_ROLE_VALUES = new Set(["customer", "cust", "client"]);
+
+// Sub types that must always be selectable in the "All Sub Types" dropdown (cloth),
+// even before any order exists for them. Anything else found in the data is added too.
+const SUBTYPE_FALLBACK_CLOTH = ["Blouse", "Dhoti", "Uniform Shirting", "Uniform Suiting"];
 
 const detectPlacement = (o, currentUserId) => {
   const rawRole = o.creator?.role;
@@ -241,21 +292,90 @@ const detectPlacement = (o, currentUserId) => {
   return "unknown";
 };
 
+/**
+ * Allocation stage for one order (or a cart group of several order lines).
+ * `members` are the mapped orders; each carries `alloc` = the matching
+ * /allocations/board entry (or null when nothing is allocated yet).
+ */
+function computeStage(members) {
+  const mtrNum = (v) => {
+    const n = parseFloat(String(v ?? "").replace(/[^\d.]/g, ""));
+    return !isNaN(n) && n > 0 ? n : 0;
+  };
+
+  let ordered = 0, allocated = 0, allApproved = true, allErp = true, earliest = null;
+  let mtrTotal = 0, singleMeters = "";
+
+  members.forEach((m) => {
+    const a = m.alloc;
+    ordered += a ? (parseFloat(a.orderedQty) || 0) : (parseFloat(m.qty) || 0);
+
+    // A rejected allocation goes back to Admin, so it counts as NOT allocated.
+    const usable = a && a.status !== "rejected";
+    const saved = usable ? (parseFloat(a.allocatedQty) || 0) : 0;
+    allocated += saved;
+
+    if (saved > 0) {
+      mtrTotal += saved * mtrNum(a.meters);
+      if (members.length === 1) singleMeters = a.meters || "";
+    }
+
+    if (!(usable && saved > 0 && a.status === "approved")) allApproved = false;
+    if (!(usable && saved > 0 && a.erpStatus === "erp_so_created")) allErp = false;
+    if (saved > 0 && a.firstAllocatedAt && (!earliest || a.firstAllocatedAt < earliest)) earliest = a.firstAllocatedAt;
+  });
+
+  const partial = allocated > 0 && allocated < ordered;
+  const age = earliest ? hoursSince(earliest) : null;
+  const expired = partial && age !== null && age >= PARTIAL_WINDOW_HOURS;
+
+  // Nothing allocated -> Pending Allocation ONLY.
+  // Something allocated but not everything -> Partial Allocation.
+  let stage;
+  if (allocated <= 0) stage = "pending_allocation";
+  else if (partial) stage = "partial_allocation";
+  else if (allErp) stage = "erp_transfer";
+  else if (allApproved) stage = "approved";
+  else stage = "fully_allocated";
+
+  return {
+    stage,
+    stageLabel: STAGE_META[stage]?.label || stage,
+    partial,
+    expired,
+    balance: Math.max(0, ordered - allocated),
+    // Shown in the table only once something is really allocated
+    hasAllocation: allocated > 0,
+    allocatedQtyTotal: allocated,
+    allocatedMtrText: allocated > 0
+      ? (members.length === 1 ? singleMeters : (mtrTotal > 0 ? `${Math.round(mtrTotal * 100) / 100}` : ""))
+      : "",
+  };
+}
+
 // placementFilter: "all" | "mine" | "customer"
-// statusFilters: pill labels (end-user uses All/Pending/Approved/Rejected)
+// (end users use the same stage dropdown as admins)
+// adminMode: admin / system_admin layout (stage dropdown + popover actions)
 function OrderListTab({
   themeG,
   navigate,
   placementFilter = "all",
-  statusFilters = STATUS_FILTERS_ADMIN,
   preferRejectedLabel = false,
+  adminMode = false,
 }) {
   const tab = localStorage.getItem("premier_category") || "cloth";
   const role = localStorage.getItem("role") || "";
   const user = JSON.parse(localStorage.getItem("user") || "{}");
   const currentUserId = user.Id ?? user.id ?? user.ID ?? user.userId ?? null;
+  const isEndUser = role === "end_user";
+  const canAllocate = ALLOCATE_ROLES.includes(role);
+  // Admin / System Admin AND End User all get the allocation-stage dropdown.
+  // (adminMode still controls the admin-only action menu and board data.)
+  const stageMode = adminMode || role === "end_user";
 
   const [filterStatus, setFilterStatus] = useState("All");
+  const [uomFilter, setUomFilter] = useState("All");
+  const [subTypeFilter, setSubTypeFilter] = useState("All");
   const [search, setSearch] = useState("");
   const [orders, setOrders] = useState([]);
   const [customers, setCustomers] = useState([]);
@@ -268,35 +388,37 @@ function OrderListTab({
   const load = async () => {
     try {
       const params = {};
-      if (role === "end_user") params.scope = "own";
+      if (role === "end_user") { params.scope = "own"; params.with_allocation = 1; }
       else if (role === "admin") params.scope = "own_and_team";
 
-      const [ordRes, custRes, prodRes, usersRes] = await Promise.all([
+      const [ordRes, custRes, prodRes, usersRes, boardRes] = await Promise.all([
         API.get("/orders", { params }),
         API.get("/customers"),
         API.get("/products"),
         API.get("/users", { params: { roles: "admin,system_admin,end_user" } }).catch(() => ({ data: [] })),
+        // Real allocation / approval / ERP data, same source as Marketing Review.
+        adminMode
+          ? API.get("/allocations/board").catch(() => ({ data: { products: [] } }))
+          : Promise.resolve(null),
       ]);
       const people = usersRes.data || [];
       setFollowPeople(people);
 
+      // orderId -> allocation entry from the board
+      const allocByOrderId = {};
+      (boardRes?.data?.products || []).forEach((p) => {
+        (p.customers || []).forEach((c) => { if (c.orderId) allocByOrderId[c.orderId] = c; });
+      });
+
       // Keyed by customer id so each order can look up its own customer's
-      // registered Contact Person — same field ProductCatalog.jsx shows
-      // under "Contact Person" (customer?.ContactPersons?.[0]?.contactName).
+      // registered Contact Person.
       const customersById = {};
       (custRes.data || []).forEach((c) => { customersById[c.Id] = c; });
 
-      // Keyed by product id — resolves the real Product Name for the new
-      // "Product Name" column below, for orders whose API response
-      // doesn't already eager-load the full product on `o.product`.
       const productsById = {};
       (prodRes.data || []).forEach((p) => { productsById[p.Id] = p; });
 
       const mapped = ordRes.data.map((o) => {
-        // Backend sends the loaded relation as `assignee` (Order::with([...,
-        // 'assignee', ...])) and the raw id as `AssignedTo` — not
-        // AssignedToId / assignedUser / followUser, which never matched
-        // anything the API actually returns.
         const assignedName =
           o.assignee?.Name ||
           o.assignee?.name ||
@@ -304,25 +426,31 @@ function OrderListTab({
           people.find((p) => String(p.Id ?? p.id) === String(o.AssignedTo))?.name ||
           (o.AssignedTo ? `User #${o.AssignedTo}` : null);
 
-        // No staff member has claimed this order yet (fresh customer-cart
-        // enquiry) — fall back to the customer's own registered Contact
-        // Person instead of showing a bare "—".
+        // No staff member has claimed this order yet — fall back to the
+        // customer's own registered Contact Person.
         const customer = o.customer || customersById[o.CustomerId];
         const contactPersonName = customer?.ContactPersons?.[0]?.contactName || null;
 
         const followName = assignedName || contactPersonName || "—";
 
-        // Real Product Name — prefer an eager-loaded o.product, fall back
-        // to the /products lookup by ProductId. No placeholder text.
         const productName = o.product?.Name || productsById[o.ProductId]?.Name || "—";
 
+        // UOM the customer/officer actually picked at checkout, falling back
+        // to the product's master UOM for older orders.
+        const uom = o.OrderDetails?.UOM || o.OrderDetails?.uom || o.product?.UOM || productsById[o.ProductId]?.UOM || "—";
+
+        const custObj = o.customer || customersById[o.CustomerId];
         return {
           id: o.Code,
           dbId: o.Id,
-          customer: o.customer?.Name ?? "—",
+          customerId: o.CustomerId,
+          customer: custObj?.Name ?? "—",
+          customerDistrict: custObj?.District || null,
+          customerState: custObj?.State || null,
           followPerson: followName,
           category: o.Category,
           subType: o.SubType || "—",
+          uom,
           productName,
           qty: o.Quantity,
           date: o.CreatedAt ? o.CreatedAt.substring(0, 10) : "",
@@ -330,6 +458,11 @@ function OrderListTab({
           deliveryDate: o.DeliveryDate ? o.DeliveryDate.substring(0, 10) : null,
           groupRef: o.OrderDetails?.GroupRef ?? o.OrderDetails?.CartRef ?? null,
           placement: detectPlacement(o, currentUserId),
+          // Admin: real board entry. End User: the per-order summary the
+          // orders API sends back (they can't read the staff-only board).
+          alloc: adminMode
+            ? (allocByOrderId[o.Id] || null)
+            : (o.AllocationSummary ? { ...o.AllocationSummary, orderedQty: o.Quantity } : null),
         };
       });
       setOrders(mapped);
@@ -344,10 +477,26 @@ function OrderListTab({
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
-  // Reset status filter when switching My Orders ↔ Customer Orders
+  // Reset filters when switching My Orders ↔ Customer Orders
   useEffect(() => {
     setFilterStatus("All");
+    setUomFilter("All");
+    setSubTypeFilter("All");
   }, [placementFilter]);
+
+  const UOM_FILTER_FALLBACK = ["Box", "Pieces", "Meter"];
+  const uomOptions = Array.from(
+    new Set([...orders.map((o) => o.uom).filter((u) => u && u !== "—"), ...UOM_FILTER_FALLBACK])
+  ).sort();
+
+  // Sub types found in the orders + (for cloth) the fixed four, so Uniform
+  // Shirting / Uniform Suiting are always selectable.
+  const subTypeOptions = Array.from(
+    new Set([
+      ...orders.map((o) => o.subType).filter((s) => s && s !== "—"),
+      ...(tab === "cloth" ? SUBTYPE_FALLBACK_CLOTH : []),
+    ])
+  ).sort();
 
   const groupOrders = (list) => {
     const groups = new Map();
@@ -357,6 +506,7 @@ function OrderListTab({
       if (!groups.has(o.groupRef)) groups.set(o.groupRef, []);
       groups.get(o.groupRef).push(o);
     });
+    const singleRows = singles.map((o) => (stageMode ? { ...o, ...computeStage([o]) } : o));
     const groupRows = [...groups.values()].map((members) => {
       const first = members[0];
       return {
@@ -365,18 +515,32 @@ function OrderListTab({
         memberIds: members.map((m) => m.dbId),
         members,
         qty: members.reduce((s, m) => s + (parseFloat(m.qty) || 0), 0),
+        ...(stageMode ? computeStage(members) : {}),
       };
     });
-    return [...singles, ...groupRows].sort((a, b) => b.dbId - a.dbId);
+    return [...singleRows, ...groupRows].sort((a, b) => b.dbId - a.dbId);
   };
 
-  const displayOrders = groupOrders(orders);
+  // Sale Loss / Rejected lines live on their own pages. Drop them BEFORE
+  // grouping, so the other products of the same enquiry (e.g. 2 of ORD-1015's
+  // 3 products) stay in this list instead of vanishing with the closed one.
+  const openOrders = stageMode
+    ? orders.filter((o) => !(isSaleLossStatus(o.status) || isRejectedStatus(o.status)))
+    : orders;
+  const displayOrders = groupOrders(openOrders);
 
   const placementFieldAvailable = orders.some((o) => o.placement !== "unknown");
 
   const filtered = displayOrders.filter((o) => {
     const matchTab = o.category === tab;
-    const matchStatus = statusMatchesFilter(o.status, filterStatus);
+    // Sale Loss / Rejected orders live on their own pages — keep them out of
+    // the admin / system_admin Order List.
+    const matchOpen = !stageMode || !(isSaleLossStatus(o.status) || isRejectedStatus(o.status));
+    const matchStatus = stageMode
+      ? (filterStatus === "All" || o.stage === filterStatus)
+      : statusMatchesFilter(o.status, filterStatus);
+    const matchUom = uomFilter === "All" || o.uom === uomFilter;
+    const matchSubType = subTypeFilter === "All" || o.subType === subTypeFilter;
     const matchSearch = o.id.toLowerCase().includes(search.toLowerCase())
       || o.customer.toLowerCase().includes(search.toLowerCase())
       || o.followPerson.toLowerCase().includes(search.toLowerCase())
@@ -385,9 +549,51 @@ function OrderListTab({
       placementFilter === "all" ? true :
         !placementFieldAvailable ? false :
           placementFilter === "mine" ? o.placement === "mine" :
-            placementFilter === "customer" ? o.placement === "customer" :
+            placementFilter === "customer" ? (
+              o.placement === "customer" &&
+              (() => {
+                // End-user Customer Orders: match the customer's district and state
+                // to the end-user's own district(s) / state(s) so they see local customers (e.g. Chennai).
+                if (!isEndUser) return true;
+
+                const rawDist = user.district || user.District
+                  || (() => { try { return JSON.parse(localStorage.getItem("District") || "null"); } catch { return null; } })();
+                const rawState = user.state || user.State
+                  || (() => { try { return JSON.parse(localStorage.getItem("State") || "null"); } catch { return null; } })();
+
+                let endUserDists = [];
+                try { endUserDists = Array.isArray(rawDist) ? rawDist : (rawDist ? JSON.parse(rawDist) : []); }
+                catch { endUserDists = typeof rawDist === "string" ? [rawDist] : []; }
+                if (typeof rawDist === "string" && !endUserDists.length && rawDist.trim()) endUserDists = [rawDist.trim()];
+
+                let endUserStates = [];
+                try { endUserStates = Array.isArray(rawState) ? rawState : (rawState ? JSON.parse(rawState) : []); }
+                catch { endUserStates = typeof rawState === "string" ? [rawState] : []; }
+                if (typeof rawState === "string" && !endUserStates.length && rawState.trim()) endUserStates = [rawState.trim()];
+
+                // If end user has no assigned district or state, show all
+                if (!endUserDists.length && !endUserStates.length) return true;
+
+                const custRecord = customers.find((c) => c.Id === o.customerId) ||
+                  customers.find((c) => c.Name === o.customer);
+                const custDist = String(o.customerDistrict || custRecord?.District || "").toLowerCase().trim();
+                const custState = String(o.customerState || custRecord?.State || "").toLowerCase().trim();
+
+                const distMatch = endUserDists.some((d) => {
+                  const s = String(d).toLowerCase().trim();
+                  return s && (s === custDist || s === custState);
+                });
+
+                const stateMatch = endUserStates.some((st) => {
+                  const s = String(st).toLowerCase().trim();
+                  return s && (s === custState || s === custDist);
+                });
+
+                return distMatch || stateMatch;
+              })()
+            ) :
               true;
-    return matchTab && matchStatus && matchSearch && matchPlacement;
+    return matchTab && matchOpen && matchStatus && matchUom && matchSubType && matchSearch && matchPlacement;
   });
 
   const handleDelete = async (o) => {
@@ -404,6 +610,26 @@ function OrderListTab({
     } finally {
       setDeletingId(null);
     }
+  };
+
+  // Open Marketing Review on this order's allocation line.
+  const goAllocate = (o) => {
+    const ids = o.isGroup ? o.memberIds : [o.dbId];
+    navigate(`${BATCHES_PATH}?enquiry=${encodeURIComponent(o.id)}&focus=${ids.join(",")}`);
+  };
+
+  // Status dropdown: Sale Loss / Reject open their own pages;
+  // everything else just filters the table.
+  const handleStatusChange = (value) => {
+    if (value === NAV_OPTION_SALE_LOSS) {
+      navigate(SALE_LOSS_PATH);
+      return;
+    }
+    if (value === NAV_OPTION_REJECT) {
+      navigate(REJECT_PATH);
+      return;
+    }
+    setFilterStatus(value);
   };
 
   const handleImportRows = async (rows) => {
@@ -437,12 +663,21 @@ function OrderListTab({
     placementFilter === "mine" ? "-mine" :
       placementFilter === "customer" ? "-customer" : "";
 
-  const pendingCount = filtered.filter((o) => (o.status || "").toLowerCase() === "pending").length;
-  const approvedCount = filtered.filter((o) => (o.status || "").toLowerCase() === "approved").length;
-  const rejectedCount = filtered.filter((o) => {
-    const s = (o.status || "").toLowerCase();
-    return s === "declined" || s === "rejected";
-  }).length;
+  const selectStyle = { padding: "8px 13px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 12.5, fontFamily: FONT, background: themeG.card, color: themeG.textMain, outline: "none" };
+
+  // Summary cards — icon + coloured top border, same look as the dashboard cards.
+  const statCards = preferRejectedLabel
+    ? [
+      { label: "Total Orders", value: filtered.length, color: themeG.accent, icon: Package },
+      { label: "Pending Allocation", value: filtered.filter((o) => o.stage === "pending_allocation").length, color: STAGE_META.pending_allocation.color, icon: Hourglass },
+      { label: "Partial Allocation", value: filtered.filter((o) => o.stage === "partial_allocation").length, color: STAGE_META.partial_allocation.color, icon: ClipboardCheck },
+      { label: "Approved", value: filtered.filter((o) => o.stage === "approved" || o.stage === "erp_transfer").length, color: STAGE_META.approved.color, icon: CheckCircle2 },
+    ]
+    : [
+      { label: "Total Orders", value: filtered.length, color: themeG.accent, icon: Package },
+      { label: "Pending", value: filtered.filter((o) => o.status === "pending").length, color: "#D69426", icon: Hourglass },
+      { label: "Delivered", value: filtered.filter((o) => o.status === "delivered").length, color: "#1F5C99", icon: PackageCheck },
+    ];
 
   return (
     <>
@@ -461,17 +696,6 @@ function OrderListTab({
         </div>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 22 }}>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 18px", borderRadius: 10, background: themeG.card, border: `1px solid ${themeG.border}`, boxShadow: "0 2px 8px rgba(46,122,114,0.06)" }}>
-          <span style={{ fontSize: 18 }}>{tab === "cloth" ? "👘" : "🧵"}</span>
-          <span style={{ fontFamily: FONT, fontSize: 14, fontWeight: 700, color: themeG.textMain }}>{tab === "cloth" ? "Cloth" : "Yarn"} Orders</span>
-        </div>
-        {/* <span style={{ fontSize: 12, color: themeG.textSub, fontFamily: FONT }}>
-          <span style={{ color: themeG.accent, cursor: "pointer", textDecoration: "underline" }}
-            onClick={() => navigate("/select-category")}>Switch category</span>
-        </span> */}
-      </div>
-
       <div style={{ display: "flex", gap: 12, marginBottom: 18, flexWrap: "wrap", alignItems: "center" }}>
         <input
           placeholder="Search order, customer, product, follow person…"
@@ -480,25 +704,34 @@ function OrderListTab({
           style={{ padding: "9px 14px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13, width: 260, fontFamily: FONT, background: themeG.card, outline: "none", color: themeG.textMain }}
         />
 
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {statusFilters.map((s) => (
-            <button key={s} onClick={() => setFilterStatus(s)}
-              style={{
-                padding: "6px 13px", borderRadius: 20, border: "1px solid", cursor: "pointer", fontFamily: FONT, fontSize: 12, fontWeight: 500, transition: "all 0.12s",
-                background: filterStatus === s ? "rgba(91,155,217,0.14)" : "transparent",
-                color: filterStatus === s ? themeG.accent : themeG.textSub,
-                borderColor: filterStatus === s ? "rgba(91,155,217,0.40)" : themeG.border
-              }}>
-              {s}
-            </button>
+        <select value={filterStatus} onChange={(e) => handleStatusChange(e.target.value)} style={{ ...selectStyle, minWidth: 170 }}>
+          <option value="All">All Status</option>
+          {STAGE_OPTIONS.map((st) => (
+            <option key={st.value} value={st.value}>{st.label}</option>
           ))}
-        </div>
+          <option value={NAV_OPTION_SALE_LOSS}>Sale Loss</option>
+          <option value={NAV_OPTION_REJECT}>Reject</option>
+        </select>
+
+        <select value={uomFilter} onChange={(e) => setUomFilter(e.target.value)} style={selectStyle}>
+          <option value="All">All UOM</option>
+          {uomOptions.map((u) => (
+            <option key={u} value={u}>{uomLabel(u)}</option>
+          ))}
+        </select>
+
+        <select value={subTypeFilter} onChange={(e) => setSubTypeFilter(e.target.value)} style={selectStyle}>
+          <option value="All">All Sub Types</option>
+          {subTypeOptions.map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "flex-start" }}>
           <ExcelToolbar
             themeG={themeG}
             rows={filtered}
-            columns={ORDER_EXCEL_COLUMNS}
+            columns={stageMode ? ORDER_EXCEL_COLUMNS_ADMIN : ORDER_EXCEL_COLUMNS}
             filename={`orders-${tab}${excelFilenameSuffix}`}
             onImportRows={handleImportRows}
           />
@@ -506,333 +739,117 @@ function OrderListTab({
       </div>
 
       <div style={{ display: "flex", gap: 16, marginBottom: 18 }}>
-        {(preferRejectedLabel
-          ? [
-            { label: "Total Orders", value: filtered.length, color: themeG.accent },
-            { label: "Pending", value: pendingCount, color: "#D69426" },
-            { label: "Approved", value: approvedCount, color: "#1F5C99" },
-            { label: "Rejected", value: rejectedCount, color: "#B23A3A" },
-          ]
-          : [
-            { label: "Total Orders", value: filtered.length, color: themeG.accent },
-            { label: "Pending", value: filtered.filter((o) => o.status === "pending").length, color: "#D69426" },
-            { label: "Delivered", value: filtered.filter((o) => o.status === "delivered").length, color: "#1F5C99" },
-          ]
-        ).map((s) => (
-          <div key={s.label} style={{ background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 10, padding: "12px 20px", boxShadow: "0 2px 8px rgba(46,122,114,0.05)", flex: 1 }}>
-            <p style={{ margin: "0 0 4px", fontSize: 11, color: themeG.textLabel, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: FONT }}>{s.label}</p>
-            <p style={{ margin: 0, fontSize: 22, fontWeight: 700, color: s.color, fontFamily: "'Space Grotesk', " + FONT }}>{s.value}</p>
-          </div>
-        ))}
+        {statCards.map((s) => {
+          const Icon = s.icon;
+          return (
+            <div key={s.label} style={{ background: themeG.card, border: `1px solid ${themeG.border}`, borderTop: `3px solid ${s.color}`, borderRadius: 10, padding: "12px 20px", boxShadow: "0 2px 8px rgba(46,122,114,0.05)", flex: 1 }}>
+              <Icon size={18} color={s.color} style={{ display: "block", marginBottom: 8 }} />
+              <p style={{ margin: "0 0 4px", fontSize: 11, color: themeG.textLabel, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: FONT }}>{s.label}</p>
+              <p style={{ margin: 0, fontSize: 22, fontWeight: 700, color: s.color, fontFamily: "'Space Grotesk', " + FONT }}>{s.value}</p>
+            </div>
+          );
+        })}
       </div>
 
-      <div style={{ background: "#EAF3FC", border: "1px solid rgba(91,155,217,0.35)", borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(46,122,114,0.06)" }}>
-        <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1180 }}>
-          <thead>
-            <tr style={{ borderBottom: `1px solid ${themeG.border}` }}>
-              {["S.No", "Order No", "Date", "Customer Name", "Sub Type", "Qty", "Following Person", "Delivery Date", "Status", "Actions"].map((h) => (
-                <th key={h} style={{ textAlign: "left", fontSize: 11, padding: "10px 13px", textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600, color: "#FFFFFF", background: "#1F3A63", fontFamily: FONT, whiteSpace: "nowrap" }}>
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.length === 0 ? (
-              <tr>
-                <td colSpan={11} style={{ textAlign: "center", padding: 40, color: themeG.textSub, fontSize: 14, fontFamily: FONT }}>
-                  {placementFilter === "customer"
-                    ? "No customer-placed enquiries yet. Orders you submit for a customer appear under My Orders."
-                    : placementFilter === "mine"
-                      ? "No orders placed by you yet."
-                      : "No orders found."}
-                </td>
+      <div style={{ background: "#FFFFFF", border: "1px solid rgba(91,155,217,0.35)", borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(46,122,114,0.06)" }}>
+        {/* Inline scroll — caps the body at roughly 10 rows before it
+            scrolls internally, header stays pinned via position: sticky. */}
+        <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: 520 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1180 }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${themeG.border}` }}>
+                {["S.No", "Enquiry No", "Date", "Customer Name", "Sub Type", "UOM", "Qty", "Allocated Qty", "Allocated Mtr", "Following Person", "Delivery Date", "Status", "Actions"].map((h) => (
+                  <th key={h} style={{ textAlign: "center", fontSize: 11, padding: "10px 13px", textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600, color: "#FFFFFF", background: "#1F3A63", fontFamily: FONT, whiteSpace: "nowrap", position: "sticky", top: 0, zIndex: 1 }}>
+                    {h === "Status" && stageMode ? "Allocation Status" : h}
+                  </th>
+                ))}
               </tr>
-            ) : filtered.map((o, idx) => {
-              const cc = categoryColors[o.category] || categoryColors.cloth;
-              const statusLabel = displayStatus(o.status, preferRejectedLabel);
-              return (
-                <tr key={o.id} style={{ borderBottom: "1px solid rgba(46,122,114,0.06)", background: cc.bg }}>
-                  <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textSub, fontFamily: FONT, borderLeft: `3px solid ${cc.dot}` }}>{idx + 1}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.accent, fontWeight: 700, fontFamily: FONT, whiteSpace: "nowrap" }}>
-                    {o.id}
-                    {o.isGroup && (
-                      <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: cc.dot, background: cc.border, border: `1px solid ${cc.border}`, padding: "1px 8px", borderRadius: 20 }}>
-                        {o.memberIds.length} products
-                      </span>
-                    )}
-                  </td>
-                  <td style={{ padding: "12px 13px", fontSize: 12, color: themeG.textSub, fontFamily: FONT, whiteSpace: "nowrap" }}>{o.date}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 14, color: themeG.textMain, fontWeight: 500, fontFamily: FONT }}>{o.customer}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT }}>{o.subType}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT }}>{o.qty}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textSub, fontFamily: FONT }}>{o.followPerson}</td>
-                  <td style={{ padding: "12px 13px", fontSize: 12, fontFamily: FONT, whiteSpace: "nowrap" }}>
-                    {o.deliveryDate || "—"}
-                  </td>
-                  <td style={{ padding: "12px 13px" }}><Badge text={statusLabel} colorFn={statusColor} /></td>
-                  <td style={{ padding: "12px 13px", whiteSpace: "nowrap" }}>
-                    <div style={{ display: "flex", gap: 7 }}>
-                      <button style={btnStyle("#5B9BD9")} onClick={() => navigate(`/master/orders/add?editId=${o.dbId}&mode=view`)}>👁️</button>
-                      <button style={btnStyle(themeG.accent)} onClick={() => navigate(`/master/orders/add?editId=${o.dbId}`)}>✏️</button>
-                      <button style={btnStyle("#B23A3A")} disabled={deletingId === o.dbId} onClick={() => handleDelete(o)}>
-                        {deletingId === o.dbId ? "…" : "🗑️"}
-                      </button>
-                    </div>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={13} style={{ textAlign: "center", padding: 40, color: themeG.textSub, fontSize: 14, fontFamily: FONT }}>
+                    {placementFilter === "customer"
+                      ? "No customer-placed enquiries yet. Orders you submit for a customer appear under My Orders."
+                      : placementFilter === "mine"
+                        ? "No orders placed by you yet."
+                        : "No orders found."}
                   </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ) : filtered.map((o, idx) => {
+                const cc = categoryColors[o.category] || categoryColors.cloth;
+                const statusLabel = displayStatus(o.status, preferRejectedLabel);
+
+                const menuItems = [
+                  { key: "view", label: "View", icon: Eye, onClick: () => navigate(`/master/orders/add?editId=${o.dbId}&mode=view`) },
+                  { key: "edit", label: "Edit", icon: Pencil, onClick: () => navigate(`/master/orders/add?editId=${o.dbId}`) },
+                  // ADMIN only, and only on PARTIAL allocation orders — jumps to the balance line.
+                  ...(canAllocate && o.stage === "partial_allocation"
+                    ? [{
+                      key: "alloc", label: "Edit Allocation", icon: ClipboardCheck, color: "#C2571A",
+                      hint: `Balance: ${o.balance}`,
+                      onClick: () => goAllocate(o),
+                    }]
+                    : []),
+                ];
+
+                return (
+                  <tr key={o.id} style={{ borderBottom: "1px solid rgba(46,122,114,0.06)", background: "#FFFFFF" }}>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textSub, fontFamily: FONT, borderLeft: `3px solid ${cc.dot}`, textAlign: "center" }}>{idx + 1}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.accent, fontWeight: 700, fontFamily: FONT, whiteSpace: "nowrap", textAlign: "center" }}>
+                      {o.id}
+                      {o.isGroup && (
+                        <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: cc.dot, background: cc.border, border: `1px solid ${cc.border}`, padding: "1px 8px", borderRadius: 20 }}>
+                          {o.memberIds.length} products
+                        </span>
+                      )}
+                    </td>
+                    <td style={{ padding: "12px 13px", fontSize: 12, color: themeG.textSub, fontFamily: FONT, whiteSpace: "nowrap", textAlign: "center" }}>{o.date}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 14, color: themeG.textMain, fontWeight: 500, fontFamily: FONT, textAlign: "center" }}>{o.customer}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT, textAlign: "center" }}>{o.subType}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT, textAlign: "center" }}>{uomLabel(o.uom)}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT, textAlign: "center" }}>{o.qty}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT, textAlign: "center" }}>
+                      {o.hasAllocation ? o.allocatedQtyTotal : "—"}
+                    </td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textMain, fontFamily: FONT, textAlign: "center" }}>
+                      {o.hasAllocation && o.allocatedMtrText ? o.allocatedMtrText : "—"}
+                    </td>
+                    <td style={{ padding: "12px 13px", fontSize: 13, color: themeG.textSub, fontFamily: FONT, textAlign: "center" }}>{o.followPerson}</td>
+                    <td style={{ padding: "12px 13px", fontSize: 12, fontFamily: FONT, whiteSpace: "nowrap", textAlign: "center" }}>
+                      {o.deliveryDate || "—"}
+                    </td>
+                    <td style={{ padding: "12px 13px", textAlign: "center" }}>
+                      {stageMode ? <StageBadge stage={o.stage} /> : <Badge text={statusLabel} colorFn={statusColor} />}
+                    </td>
+                    <td style={{ padding: "12px 13px", whiteSpace: "nowrap", textAlign: "center" }}>
+                      {adminMode ? (
+                        <div style={{ display: "flex", gap: 7, justifyContent: "center" }}>
+                          <ActionMenu themeG={themeG} title={o.id} items={menuItems} />
+                          <button type="button" aria-label="Delete order" style={iconBtnStyle("#B23A3A")} disabled={deletingId === o.dbId} onClick={() => handleDelete(o)}>
+                            {deletingId === o.dbId ? "…" : <Trash2 size={15} />}
+                          </button>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", gap: 7, justifyContent: "center" }}>
+                          <button style={btnStyle("#5B9BD9")} onClick={() => navigate(`/master/orders/add?editId=${o.dbId}&mode=view`)}>👁️</button>
+                          <button style={btnStyle(themeG.accent)} onClick={() => navigate(`/master/orders/add?editId=${o.dbId}`)}>✏️</button>
+                          <button style={btnStyle("#B23A3A")} disabled={deletingId === o.dbId} onClick={() => handleDelete(o)}>
+                            {deletingId === o.dbId ? "…" : "🗑️"}
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
         <div style={{ padding: "10px 13px", borderTop: `1px solid ${themeG.border}`, fontSize: 12, color: themeG.textSub, fontFamily: FONT }}>
           Showing {filtered.length} of {orders.filter((o) => o.category === tab).length} {tab} orders
         </div>
       </div>
-    </>
-  );
-}
-
-/* ───────────────────────── Tab: Order Status ─────────────────────────── */
-
-function OrderStatusTab({ themeG, navigate }) {
-  const tab = localStorage.getItem("premier_category") || "cloth";
-  const role = localStorage.getItem("role") || "";
-  const [filter, setFilter] = useState("Approved");
-  const [allOrders, setAllOrders] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [actingId, setActingId] = useState(null);
-
-  const [dispatchTarget, setDispatchTarget] = useState(null);
-  const [lrNumber, setLrNumber] = useState("");
-  const [transportName, setTransportName] = useState("");
-  const [dispatching, setDispatching] = useState(false);
-
-  const load = async () => {
-    setLoading(true);
-    try {
-      const res = await API.get("/orders", { params: filter !== "all" ? { status: filter } : {} });
-      setAllOrders(res.data);
-    } catch (err) {
-      setError("Failed to load orders.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [filter]);
-
-  const orders = allOrders.filter((o) => o.Category === tab);
-
-  const th = { textAlign: "left", fontSize: 11, padding: "12px 16px", borderBottom: "1px solid rgba(46,122,114,0.13)", textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600, color: "#FFFFFF", background: "#1F3A63" };
-  const td = { padding: "13px 16px", fontSize: 13.5, color: themeG.textMain };
-
-  const setStatus = async (id, status) => {
-    setActingId(id);
-    setError("");
-    try {
-      await API.patch(`/orders/${id}/status`, { status });
-      load();
-    } catch (err) {
-      setError(err.response?.data?.message || "Failed to update status.");
-    } finally {
-      setActingId(null);
-    }
-  };
-
-  const releaseHold = async (id) => {
-    const note = window.prompt("Note for releasing this credit/discount hold (optional):") || "";
-    setActingId(id);
-    setError("");
-    try {
-      await API.patch(`/orders/${id}/release-hold`, { note });
-      load();
-    } catch (err) {
-      setError(err.response?.data?.message || "Failed to release hold.");
-    } finally {
-      setActingId(null);
-    }
-  };
-
-  const openDispatch = (order) => {
-    setDispatchTarget(order);
-    setLrNumber("");
-    setTransportName("");
-    setError("");
-  };
-
-  const submitDispatch = async () => {
-    if (!lrNumber.trim() || !transportName.trim()) {
-      setError("LR Number and Transport Name are both required.");
-      return;
-    }
-    setDispatching(true);
-    setError("");
-    try {
-      await API.patch(`/orders/${dispatchTarget.Id}/dispatch`, {
-        lrNumber: lrNumber.trim(),
-        transportName: transportName.trim(),
-      });
-      setDispatchTarget(null);
-      load();
-    } catch (err) {
-      setError(err.response?.data?.message || "Failed to dispatch order.");
-    } finally {
-      setDispatching(false);
-    }
-  };
-
-  return (
-    <>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 18px", borderRadius: 10, background: themeG.card, border: `1px solid ${themeG.border}`, boxShadow: "0 2px 8px rgba(46,122,114,0.06)" }}>
-          <span style={{ fontSize: 18 }}>{tab === "cloth" ? "👘" : "🧵"}</span>
-          <span style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 700, color: themeG.textMain }}>{tab === "cloth" ? "Cloth" : "Yarn"} Orders</span>
-        </div>
-        {/* <span style={{ fontSize: 12, color: themeG.textSub }}>
-          <span style={{ color: themeG.accent, cursor: "pointer", textDecoration: "underline" }}
-            onClick={() => navigate("/select-category")}>Switch category</span>
-        </span> */}
-      </div>
-
-      <div style={{ display: "flex", gap: 8, marginBottom: 24, flexWrap: "wrap" }}>
-        {["pending", "approved", "processing", "dispatched", "delivered", "declined", "all"].map((f) => (
-          <button key={f} onClick={() => setFilter(f)}
-            style={{ padding: "8px 16px", borderRadius: 20, border: "1.5px solid", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, textTransform: "capitalize", background: filter === f ? themeG.accent : themeG.card, color: filter === f ? themeG.card : themeG.textSub, borderColor: filter === f ? themeG.accent : themeG.border }}>
-            {f}
-          </button>
-        ))}
-      </div>
-
-      {error && (
-        <div style={{ marginBottom: 16, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>
-          {error}
-        </div>
-      )}
-
-      <div style={{ background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(46,122,114,0.05)" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr>
-              {["Order", "Customer", "Product", "Qty", "Amount", "Status", "Actions"].map((h) => (
-                <th key={h} style={th}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <tr><td colSpan={7} style={{ ...td, textAlign: "center", padding: 30 }}>Loading…</td></tr>
-            ) : orders.length === 0 ? (
-              <tr><td colSpan={7} style={{ ...td, textAlign: "center", padding: 30, color: themeG.textSub }}>No orders in this filter.</td></tr>
-            ) : orders.map((o) => (
-              <tr key={o.Id} style={{ borderBottom: "1px solid rgba(46,122,114,0.08)" }}>
-                <td style={{ ...td, fontWeight: 600, color: themeG.accent, cursor: "pointer" }} onClick={() => navigate(`/master/orders/${o.Id}`)}>{o.Code}</td>
-                <td style={td}>{o.customer?.Name ?? "—"}</td>
-                <td style={td}>{o.product?.Name ?? "—"}</td>
-                <td style={td}>{o.Quantity}</td>
-                <td style={{ ...td, fontWeight: 600 }}>₹{parseFloat(o.TotalAmount).toLocaleString()}</td>
-                <td style={td}><Badge text={o.Status} colorFn={statusColor} /></td>
-                <td style={td}>
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                    {o.OnHold && (
-                      <>
-                        <span title={o.HoldReason} style={{ background: "rgba(178,58,58,0.10)", color: "#96302F", border: "1px solid rgba(178,58,58,0.26)", padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 700 }}>
-                          ⛔ On Hold — credit/discount review
-                        </span>
-                        <button disabled={actingId === o.Id} onClick={() => releaseHold(o.Id)} style={actionBtn("rgba(46,122,114,0.10)", "#2E7A72", "rgba(46,122,114,0.28)")}>
-                          Release Hold
-                        </button>
-                      </>
-                    )}
-                    {o.Status === "pending" && (
-                      <>
-                        {role === "system_admin" ? (
-                          <button disabled={actingId === o.Id} onClick={() => setStatus(o.Id, "approved")} style={actionBtn("rgba(91,155,217,0.12)", themeG.accent, "rgba(91,155,217,0.30)")}>Approve</button>
-                        ) : (
-                          <span style={{ fontSize: 11.5, fontWeight: 600, color: themeG.textSub, fontStyle: "italic" }}>
-                            Pending Marketing Head approval
-                          </span>
-                        )}
-                        <button disabled={actingId === o.Id} onClick={() => setStatus(o.Id, "declined")} style={actionBtn("rgba(178,58,58,0.08)", "#B23A3A", "rgba(178,58,58,0.26)")}>Decline</button>
-                      </>
-                    )}
-                    {o.Status === "approved" && (
-                      <button disabled={actingId === o.Id} onClick={() => setStatus(o.Id, "processing")} style={actionBtn("rgba(58,92,140,0.10)", "#3A5C8C", "rgba(58,92,140,0.26)")}>Start Processing</button>
-                    )}
-                    {o.Status === "processing" && (
-                      <button disabled={actingId === o.Id} onClick={() => openDispatch(o)} style={actionBtn("rgba(74,46,122,0.10)", "#3A2560", "rgba(74,46,122,0.28)")}>Dispatch</button>
-                    )}
-                    {o.Status === "dispatched" && (
-                      <button disabled={actingId === o.Id} onClick={() => setStatus(o.Id, "delivered")} style={actionBtn("rgba(91,155,217,0.12)", themeG.accent, "rgba(91,155,217,0.30)")}>Mark Delivered</button>
-                    )}
-                    {o.Status === "dispatched" && o.LRNumber && (
-                      <span style={{ fontSize: 11.5, color: themeG.textSub }}>LR: {o.LRNumber} · {o.TransportName}</span>
-                    )}
-                    {(o.Status === "delivered" || o.Status === "declined") && (
-                      <span style={{ fontSize: 12, color: themeG.textSub }}>
-                        No further action{o.LRNumber ? ` · LR: ${o.LRNumber}` : ""}
-                      </span>
-                    )}
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <p style={{ marginTop: 14, fontSize: 13, color: themeG.textSub }}>
-        Showing {orders.length} {tab} order{orders.length !== 1 ? "s" : ""} ({filter})
-      </p>
-
-      {dispatchTarget && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(8,20,34,0.35)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
-          onClick={() => setDispatchTarget(null)}>
-          <div style={{ background: "#ffffff", borderRadius: 16, padding: 28, width: 400, boxShadow: "0 12px 40px rgba(0,0,0,0.18)" }}
-            onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ fontFamily: "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif", fontSize: 18, margin: "0 0 4px", color: themeG.textMain }}>
-              Dispatch {dispatchTarget.Code}
-            </h3>
-            <p style={{ fontSize: 12, color: themeG.textSub, margin: "0 0 18px" }}>
-              {dispatchTarget.customer?.Name} · {dispatchTarget.product?.Name}
-            </p>
-
-            {error && (
-              <div style={{ background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 8, padding: "9px 12px", marginBottom: 14, fontSize: 12, color: "#B23A3A" }}>
-                {error}
-              </div>
-            )}
-
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#526073", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 5 }}>LR Number *</label>
-              <input type="text" value={lrNumber} onChange={(e) => setLrNumber(e.target.value)}
-                placeholder="e.g. LR-48213"
-                style={{ width: "100%", boxSizing: "border-box", background: "#F5F7FA", border: "1px solid rgba(46,122,114,0.22)", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: "#0F2138", fontFamily: "inherit", outline: "none" }} />
-            </div>
-
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#526073", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 5 }}>Transport Name *</label>
-              <input type="text" value={transportName} onChange={(e) => setTransportName(e.target.value)}
-                placeholder="e.g. VRL Logistics"
-                style={{ width: "100%", boxSizing: "border-box", background: "#F5F7FA", border: "1px solid rgba(46,122,114,0.22)", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: "#0F2138", fontFamily: "inherit", outline: "none" }} />
-            </div>
-
-            <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-              <button onClick={submitDispatch} disabled={dispatching}
-                style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: themeG.accent, color: "#fff", cursor: dispatching ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 13.5, fontWeight: 700, opacity: dispatching ? 0.6 : 1 }}>
-                {dispatching ? "Dispatching…" : "Confirm Dispatch"}
-              </button>
-              <button onClick={() => setDispatchTarget(null)}
-                style={{ flex: 1, padding: "10px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, cursor: "pointer", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600 }}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }

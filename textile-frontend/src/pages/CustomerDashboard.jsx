@@ -6,6 +6,7 @@ import { useTheme } from "../ThemeContext";
 import { getG, statusColor } from "../theme";
 import API from "../services/api";
 import { groupOrders } from "../utils/groupOrders";
+import { Package, Hourglass, CheckCircle2, XCircle } from "lucide-react";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -66,9 +67,9 @@ export default function CustomerDashboard() {
     tableTitle: { fontFamily: FONT, fontSize: 17, fontWeight: 600, margin: 0, color: themeG.textMain },
     tableCount: { fontSize: 12, color: themeG.textSub, background: "rgba(15,33,56,0.09)", padding: "3px 10px", borderRadius: 20, border: "1px solid rgba(15,33,56,0.18)" },
     viewAllLink: { fontSize: 12.5, color: themeG.accent, fontWeight: 600, cursor: "pointer", background: "none", border: "none", fontFamily: FONT },
-    table: { width: "100%", borderCollapse: "collapse" },
-    th: { textAlign: "left", fontSize: 11, color: "#ffffff", background: "#1f3a63", padding: "8px 12px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 }, tr: { borderBottom: `1px solid ${themeG.border}` },
-    td: { padding: "13px 12px", fontSize: 14, color: themeG.textMain },
+    table: { width: "100%", borderCollapse: "separate", borderSpacing: 0 },
+    th: { textAlign: "center", fontSize: 11, color: "#ffffff", background: "#1f3a63", padding: "8px 12px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 }, tr: { borderBottom: `1px solid ${themeG.border}` },
+    td: { padding: "13px 12px", fontSize: 14, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center" },
 
     sectionTitle: { fontFamily: "'Space Grotesk', " + FONT, fontSize: 20, fontWeight: 700, margin: "36px 0 4px", color: themeG.textMain },
     sectionSub: { fontSize: 12.5, color: themeG.textSub, margin: "0 0 16px" },
@@ -79,8 +80,8 @@ export default function CustomerDashboard() {
     widgetBox: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, padding: "18px 20px", boxShadow: "0 3px 12px rgba(15,33,56,0.05)", marginBottom: 22 },
     widgetTitle: { fontSize: 14.5, fontWeight: 700, color: themeG.textMain, margin: "0 0 12px" },
     smallTable: { width: "100%", borderCollapse: "collapse", fontSize: 12.5 },
-    smallTh: { textAlign: "left", padding: "6px 8px", color: themeG.textLabel, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${themeG.border}` },
-    smallTd: { padding: "8px 8px", color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` },
+    smallTh: { textAlign: "center", padding: "6px 8px", color: themeG.textLabel, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${themeG.border}` },
+    smallTd: { padding: "8px 8px", color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center" },
     emptyNote: { fontSize: 12.5, color: themeG.textSub, padding: "8px 0" },
     approxNote: { fontSize: 11, color: themeG.textSub, fontStyle: "italic", marginTop: 10 },
   };
@@ -115,30 +116,33 @@ export default function CustomerDashboard() {
   // that's deliberately counting per-product occurrences. ──
   const groupedOrders = groupOrders(orders);
 
-  // ── Top stat cards ──
-  const total = groupedOrders.length;
-  const activeOrders = groupedOrders.filter(g => ["pending", "approved", "processing"].includes(norm(g.status)));
-  const totalRevenue = groupedOrders.reduce((sum, g) => sum + g.totalAmount, 0);
+  // ── Top stat cards count actual order rows (matches "My Orders"),
+  // not cart-checkout groups. A grouped cart's displayed status is
+  // just its first row's status (see groupOrders.js), so counting by
+  // group hid every other item in a multi-status cart — a cart with
+  // 4 Pending + 1 Processing item showed as 1 "Processing" order and
+  // 0 Pending, instead of 4 Pending + 1 Processing. ──
+  const total = orders.length;
+
+  // ── Enquiry Status (now shown as the top 4 pills) ──
+  const enquiryStatus = {
+    total,
+    pending: orders.filter(o => norm(o.Status) === "pending").length,
+    approvedPlus: orders.filter(o => ["approved", "processing", "dispatched", "delivered"].includes(norm(o.Status))).length,
+    declined: orders.filter(o => DECLINED_STATUSES.includes(norm(o.Status))).length,
+  };
 
   const statCards = [
-    { label: "My Orders", value: loading ? "—" : total.toLocaleString(), icon: "📦", accent: "#1E4A45" },
-    { label: "In Progress", value: loading ? "—" : activeOrders.length.toLocaleString(), icon: "⏳", accent: "#D69426" },
-    { label: "Delivered", value: loading ? "—" : groupedOrders.filter(g => norm(g.status) === "delivered").length.toLocaleString(), icon: "✅", accent: "#2E7A72" },
-    { label: "Total Value", value: loading ? "—" : formatRevenue(totalRevenue), icon: "📈", accent: "#3A2560" },
+    { label: "Total", value: loading ? "—" : enquiryStatus.total.toLocaleString(), icon: Package, accent: "#2E7A72" },
+    { label: "Pending", value: loading ? "—" : enquiryStatus.pending.toLocaleString(), icon: Hourglass, accent: "#D69426" },
+    { label: "Approved+", value: loading ? "—" : enquiryStatus.approvedPlus.toLocaleString(), icon: CheckCircle2, accent: "#1E4A45" },
+    { label: "Declined", value: loading ? "—" : enquiryStatus.declined.toLocaleString(), icon: XCircle, accent: "#B23A3A" },
   ];
 
   // ── Recent orders ──
   const recentOrders = [...groupedOrders]
     .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
     .slice(0, 5);
-
-  // ── Enquiry Status ──
-  const enquiryStatus = {
-    total,
-    pending: groupedOrders.filter(g => norm(g.status) === "pending").length,
-    approvedPlus: groupedOrders.filter(g => ["approved", "processing", "dispatched", "delivered"].includes(norm(g.status))).length,
-    declined: groupedOrders.filter(g => DECLINED_STATUSES.includes(norm(g.status))).length,
-  };
 
   // ── Product-wise breakdown of my enquiries — deliberately stays
   // row-based (per product), not order-based, since a single order
@@ -198,10 +202,10 @@ export default function CustomerDashboard() {
 
       {/* Top bar */}
       <div style={styles.topBar}>
-        <div>
+        {/* <div>
           <h1 style={styles.heading}>Dashboard</h1>
           <p style={styles.headingSub}>Welcome back, {user.name || "Customer"}</p>
-        </div>
+        </div> */}
         <div style={{ display: "flex", alignItems: "center" }}>
 
           <button style={styles.shopBtn} onClick={() => navigate("/customer/catalog")}>🛍️ Continue Shopping</button>
@@ -214,12 +218,12 @@ export default function CustomerDashboard() {
         </div>
       )}
 
-      {/* Stat cards */}
+      {/* Stat cards — Enquiry Status */}
       <div style={styles.grid}>
         {statCards.map((card) => (
           <div key={card.label} style={styles.statCard}>
             <div style={{ ...styles.cardStripe, background: card.accent }} />
-            <span style={styles.cardIcon}>{card.icon}</span>
+            <card.icon size={22} color={card.accent} style={styles.cardIcon} />
             <p style={styles.cardLabel}>{card.label}</p>
             <p style={{ ...styles.cardValue, color: card.accent }}>{card.value}</p>
           </div>
@@ -238,22 +242,32 @@ export default function CustomerDashboard() {
         <table style={styles.table}>
           <thead>
             <tr>
-              {["S.No", "Order ID", "Product", "Amount", "Status"].map((h) => (
-                <th key={h} style={styles.th}>{h}</th>
+              {["S.No", "Enquiry No", "Enquiry Date", "Product", "Quantity", "Status"].map((h, i, arr) => (
+                <th
+                  key={h}
+                  style={{
+                    ...styles.th,
+                    borderTopLeftRadius: i === 0 ? 14 : 0,
+                    borderTopRightRadius: i === arr.length - 1 ? 14 : 0,
+                  }}
+                >
+                  {h}
+                </th>
               ))}
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={5} style={{ ...styles.td, textAlign: "center", padding: 30 }}>Loading recent orders…</td></tr>
+              <tr><td colSpan={6} style={{ ...styles.td, textAlign: "center", padding: 30 }}>Loading recent orders…</td></tr>
             ) : recentOrders.length === 0 ? (
-              <tr><td colSpan={5} style={{ ...styles.td, textAlign: "center", padding: 30 }}>No orders yet — head to the Product Catalog to place your first enquiry.</td></tr>
+              <tr><td colSpan={6} style={{ ...styles.td, textAlign: "center", padding: 30 }}>No orders yet — head to the Product Catalog to place your first enquiry.</td></tr>
             ) : recentOrders.map((g, i) => (
               <tr key={g.groupKey} style={styles.tr}>
                 <td style={styles.td}>{i + 1}</td>
                 <td style={{ ...styles.td, color: themeG.accent, fontWeight: 600 }}>{g.code}</td>
+                <td style={styles.td}>{g.createdAt ? String(g.createdAt).substring(0, 10) : "—"}</td>
                 <td style={styles.td}>{g.productLabel}</td>
-                <td style={{ ...styles.td, fontWeight: 600 }}>₹{g.totalAmount.toLocaleString()}</td>
+                <td style={styles.td}>{g.totalQty.toLocaleString()}</td>
                 <td style={styles.td}><Badge text={g.status} /></td>
               </tr>
             ))}
@@ -263,24 +277,7 @@ export default function CustomerDashboard() {
 
       {!loading && (
         <>
-          {/* 1. Enquiry Status */}
-          <h2 style={styles.sectionTitle}>My Enquiry Status</h2>
-          <p style={styles.sectionSub}>All the enquiries you've placed and where they currently stand.</p>
-          <div style={styles.miniGrid(4)}>
-            {[
-              ["Total", enquiryStatus.total, "#2E7A72"],
-              ["Pending", enquiryStatus.pending, "#D69426"],
-              ["Approved+", enquiryStatus.approvedPlus, "#1E4A45"],
-              ["Declined", enquiryStatus.declined, "#B23A3A"],
-            ].map(([label, val, color]) => (
-              <div key={label} style={styles.miniCard}>
-                <p style={styles.miniLabel}>{label}</p>
-                <p style={{ ...styles.miniValue, color }}>{val}</p>
-              </div>
-            ))}
-          </div>
-
-          {/* 2. Product-wise breakdown */}
+          {/* 1. Product-wise breakdown */}
           <h2 style={styles.sectionTitle}>Products I've Ordered</h2>
           <p style={styles.sectionSub}>Your most-enquired products, by number of orders.</p>
           <div style={styles.widgetBox}>
@@ -296,7 +293,7 @@ export default function CustomerDashboard() {
             )}
           </div>
 
-          {/* 3. Dispatch Status */}
+          {/* 2. Dispatch Status */}
           <h2 style={styles.sectionTitle}>Dispatch Status</h2>
           <div style={styles.miniGrid(3)}>
             {[
@@ -311,7 +308,7 @@ export default function CustomerDashboard() {
             ))}
           </div>
 
-          {/* 4. Pending Dispatch Aging */}
+          {/* 3. Pending Dispatch Aging */}
           <h2 style={styles.sectionTitle}>Pending Dispatch — Aging</h2>
           <p style={styles.sectionSub}>How long your approved orders have been waiting to ship.</p>
           <div style={styles.miniGrid(3)}>
@@ -340,7 +337,7 @@ export default function CustomerDashboard() {
             )}
           </div>
 
-          {/* 5. Stock Shortage on my pending enquiries */}
+          {/* 4. Stock Shortage on my pending enquiries
           <h2 style={styles.sectionTitle}>Enquiries Awaiting — Stock Shortage</h2>
           <p style={styles.sectionSub}>Pending enquiries where you've requested more than is currently in stock.</p>
           <div style={styles.widgetBox}>
@@ -354,9 +351,9 @@ export default function CustomerDashboard() {
                 </tbody>
               </table>
             )}
-          </div>
+          </div> */}
 
-          {/* 6. Declined enquiries */}
+          {/* 5. Declined enquiries */}
           <h2 style={styles.sectionTitle}>Declined Enquiries</h2>
           <div style={styles.miniGrid(2)}>
             <div style={styles.miniCard}>
@@ -381,7 +378,7 @@ export default function CustomerDashboard() {
             </div>
           )}
 
-          {/* 8. Long pending orders */}
+          {/* 6. Long pending orders */}
           <h2 style={styles.sectionTitle}>Long Pending Orders</h2>
           <p style={styles.sectionSub}>Approved or processing for 3+ days without dispatch — you may want to follow up.</p>
           <div style={styles.widgetBox}>

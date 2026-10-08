@@ -59,8 +59,18 @@ export default function RaiseComplaint() {
     try {
       const res = await API.post("/complaints", { orderId, type, description });
       setNotice(res.data?.message || "Complaint submitted. Our team will get back to you shortly.");
-      setComplaints((prev) => [res.data?.complaint || { OrderId: orderId, Type: type, Description: description, Status: "Open", createdAt: new Date().toISOString() }, ...prev]);
-      setOrderId("");
+      // Reload the list from the server so the new row has the same data
+      // (including the order code) as it will after a refresh.
+      try {
+        const refreshed = await API.get("/complaints");
+        setComplaints(refreshed.data);
+      } catch {
+        const chosen = orders.find((o) => String(o.Id) === String(orderId));
+        setComplaints((prev) => [
+          { OrderCode: chosen?.Code, Type: type, Description: description, Status: "Open", createdAt: new Date().toISOString() },
+          ...prev,
+        ]);
+      } setOrderId("");
       setType(COMPLAINT_TYPES[0]);
       setDescription("");
     } catch (err) {
@@ -83,7 +93,7 @@ export default function RaiseComplaint() {
 
     historyCard: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)" },
     table: { width: "100%", borderCollapse: "collapse" },
-    th: { textAlign: "left", fontSize: 11,color: "#FFFFFF", background: "#1F3A63", padding: "12px 16px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 },
+    th: { textAlign: "left", fontSize: 11, color: "#FFFFFF", background: "#1F3A63", padding: "12px 16px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 600 },
     td: { padding: "13px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` },
     statusTag: (open) => ({ fontSize: 11.5, fontWeight: 600, padding: "3px 11px", borderRadius: 20, background: open ? "rgba(168,112,31,0.12)" : "rgba(46,122,114,0.12)", color: open ? "#D69426" : "#1E4A45", border: `1px solid ${open ? "rgba(168,112,31,0.3)" : "rgba(46,122,114,0.3)"}` }),
   };
@@ -92,8 +102,6 @@ export default function RaiseComplaint() {
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      <h1 style={S.heading}>Raise a Complaint</h1>
-      <p style={S.headingSub}>Let us know about any issue with a product or order — we'll follow up directly.</p>
 
       {error && (
         <div style={{ marginBottom: 20, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>
@@ -140,7 +148,7 @@ export default function RaiseComplaint() {
         <table style={S.table}>
           <thead>
             <tr>
-              {["Date", "Order", "Type", "Description", "Status"].map((h) => (
+              {["Date", "Enquiry", "Type", "Description", "Status"].map((h) => (
                 <th key={h} style={S.th}>{h}</th>
               ))}
             </tr>

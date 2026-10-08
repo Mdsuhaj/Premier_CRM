@@ -433,10 +433,10 @@ export default function AddProduct() {
 
       {/* ── Category locked badge ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 28 }}>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 18px", borderRadius: 10, background: themeG.card, border: `1px solid ${themeG.border}`, boxShadow: "0 2px 8px rgba(46,122,114,0.06)" }}>
+        {/* <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 18px", borderRadius: 10, background: themeG.card, border: `1px solid ${themeG.border}`, boxShadow: "0 2px 8px rgba(46,122,114,0.06)" }}>
           <span style={{ fontSize: 18 }}>{tab === "cloth" ? "👘" : "🧵"}</span>
           <span style={{ fontFamily: FONT, fontSize: 14, fontWeight: 700, color: themeG.textMain }}>{tab === "cloth" ? "Cloth" : "Yarn"}</span>
-        </div>
+        </div> */}
         {/* <span style={{ fontSize: 12, color: themeG.textSub, fontFamily: FONT }}>
           Category locked — <span style={{ color: themeG.accent, cursor: "pointer", textDecoration: "underline" }}
             onClick={() => navigate("/select-category")}>Switch category</span>

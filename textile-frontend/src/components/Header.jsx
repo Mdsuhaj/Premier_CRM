@@ -23,6 +23,20 @@ const pageTitles = {
   "/customer/dashboard":"Customer Dashboard",
   "/customer/shop": "Order Enquiry",
   "/customer/orders": "My Orders",
+  "/customer/complaints": "Raise a Complaint",
+  "/customer/catalog": "Product Selection",
+  "/customer/drafts": "Drafts",
+  "/customer/enquiry": "Order Enquiry",
+  "/customer/track": "Track Orders",
+  "/end-user/dashboard": "Dashboard",
+  "/end-user/customers": "Customer List",
+  "/end-user/customers/add": "Add Customer",
+  "/end-user/product-selection": "Product Selection",
+  "/end-user/order-cart": "Order Cart",
+  "/end-user/enquiry": "Order Enquired",
+  "/end-user/complaints": "Complaints & Claims",
+  "/end-user/drafts": "My Drafts",
+  "/master/claims": "Complaints & Claims",
 };
 
 
@@ -37,7 +51,7 @@ const STAFF_ROLES = [
   { value: "super_admin",   label: "Super Admin" },
 ];
 
-export default function Header() {
+export default function Header({ sidebarOpen, onToggleSidebar, pageTitle: pageTitleProp } = {}) {
   const location = useLocation();
   const navigate = useNavigate();
   const { isDark, toggleTheme, colors } = useTheme();
@@ -47,7 +61,8 @@ export default function Header() {
   // Admin / System Admin / Super Admin) only ever see the other three
   // staff roles plus themselves — the two groups never mix.
   const visibleRoles = role === "customer" ? CUSTOMER_ROLES : STAFF_ROLES;
-  const pageTitle = pageTitles[location.pathname] || "Premier CRM";
+  // A page's own title (passed down by its layout) wins, then the route map.
+  const pageTitle = pageTitleProp || pageTitles[location.pathname] || "Premier CRM";
 
   const [dropOpen, setDropOpen] = useState(false);
   const [roleMenuOpen, setRoleMenuOpen] = useState(false);
@@ -143,6 +158,21 @@ export default function Header() {
     }}>
       {/* Left */}
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        {onToggleSidebar && (
+          <button
+            onClick={onToggleSidebar}
+            title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center",
+              width: 34, height: 34, borderRadius: 8, flexShrink: 0,
+              background: "rgba(255,255,255,0.12)",
+              border: "1.5px solid rgba(255,255,255,0.25)",
+              color: "#ffffff", cursor: "pointer", padding: 0,
+            }}
+          >
+            <HamburgerIcon />
+          </button>
+        )}
         <div style={{ display: "flex", flexDirection: "column" }}>
           <span style={{ fontSize: 20, fontWeight: 700, color: "#ffffff", fontFamily: "'Space Grotesk', " + FONT, letterSpacing: "-0.3px", lineHeight: 1.1 }}>
             {pageTitle}
@@ -411,6 +441,15 @@ function BellIcon() {
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
       <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+    </svg>
+  );
+}
+function HamburgerIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
     </svg>
   );
 }

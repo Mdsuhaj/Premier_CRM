@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import API from "../services/api";
 import logo from '/premier-icon.png';
-import bgImage from '/textile.jpg';
+import bgImage from '/blue_background.png';
 
 // Staff roles selectable from the login dropdown. Customer login is kept
 // completely separate (a single "Shop Name" field) since a customer
@@ -235,7 +235,7 @@ function AlertIcon() {
 
 const styles = {
   page: {
-    minHeight: "100vh",
+    minHeight: "100%",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -341,7 +341,7 @@ input: {
 btn: {
   width: "100%",
   padding: "12px 0",
-  background: "#1F5C99",
+  background: "#24a822",
   border: "none",
   borderRadius: 8,
   fontSize: 15,

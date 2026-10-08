@@ -4,6 +4,16 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 
+/**
+ * @deprecated LEGACY / READ-ONLY.
+ *
+ * The allocation workflow this table used to hold now lives directly on
+ * App\Models\SaleOrderLine (CrmAllocationStatus, CrmErpStatus, etc — see
+ * database/migrations/2026_09_25_*). The underlying table has been renamed
+ * to `product_allocations_legacy` and nothing in the app writes to it any
+ * more. This model is kept only so old data can still be queried/reported
+ * on if needed; point $table at the renamed table to use it that way.
+ */
 class ProductAllocation extends Model
 {
     protected $table = 'product_allocations';
@@ -24,6 +34,7 @@ class ProductAllocation extends Model
         'DecidedBy',
         'DecidedAt',
         'ErpTransferredAt',
+        'Meters',
     ];
 
     protected $casts = [

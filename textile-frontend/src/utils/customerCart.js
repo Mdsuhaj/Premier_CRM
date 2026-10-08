@@ -55,14 +55,37 @@ export function getCartCount() {
 // A "line" is a product + a specific Color/Size requirement. The same
 // product with a different color/size is tracked as its own line so a
 // customer can request e.g. 5 Red-M and 3 Blue-L of the same product.
-export function addToCart({ product, qty, color, size }) {
+// piecesOfLength: free-text value from the "Pieces of Length" column on
+// the Product Catalog page — carried on the cart line alongside qty so
+// it survives through to Order Enquiry submission, same as color/size.
+//
+// uom: the UOM (Box / Pieces / Meter) the customer had selected on the
+// Product Catalog page's UOM dropdown at the moment this row was added
+// — FIX: this used to be silently dropped because this function never
+// destructured a `uom` param at all, even though ProductCatalog.jsx was
+// already passing `uom: uomFilter` into every addToCart() call. That
+// meant every cart line (and everything downstream of it — Order
+// Enquiry's UOM column, the submitted enquiry) always fell back to
+// whatever hardcoded default a page used, never the UOM the customer
+// actually picked. Now stored on the line, same as piecesOfLength.
+// remarks: free-text note typed on Product Catalog's per-row Remarks
+// column — FIX: same class of bug as piecesOfLength/uom above. This
+// function never destructured a `remarks` param, so even though
+// ProductCatalog.jsx was already passing `remarks: getRowRemarks(...)`
+// into every addToCart() call, it was silently dropped and never made
+// it onto the cart line — which is why Order Enquiry's Remarks column
+// always showed "—". Now stored on the line the same way.
+export function addToCart({ product, qty, color, size, piecesOfLength, uom, remarks }) {
   const items = readCart();
-  const key = `${product.Id}::${color || ""}::${size || ""}`;
+  const key = `${product.RowKey ?? product.Id}::${color || ""}::${size || ""}`;
   const existing = items.find((i) => i.key === key);
   const cap = product.Quantity || Infinity;
 
   if (existing) {
     existing.qty = Math.min(existing.qty + qty, cap);
+    existing.piecesOfLength = piecesOfLength ?? existing.piecesOfLength ?? "";
+    existing.uom = uom || existing.uom || "Box";
+    existing.remarks = remarks ?? existing.remarks ?? "";
   } else {
     items.push({
       key,
@@ -70,6 +93,9 @@ export function addToCart({ product, qty, color, size }) {
       qty: Math.min(Math.max(qty, 1), cap),
       color: color || "",
       size: size || "",
+      piecesOfLength: piecesOfLength || "",
+      uom: uom || "Box",
+      remarks: remarks || "",
     });
   }
   writeCart(items);

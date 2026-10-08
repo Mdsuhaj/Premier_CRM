@@ -1,57 +1,34 @@
 // src/pages/ProductCatalog.jsx
 //
-// Product Selection — picking a Type (e.g. Dhoti) shows its SubType
-// sub-tabs (Cotton Dhoti Grey/Fabric), then a single combined "Product
-// Name" search box: type to filter, or open it to pick straight from the
-// list — one control instead of a separate search field + dropdown.
-// Whatever matches shows up as a scrollable table below (same table
-// style as the Field Officer's Product Selection screen: Sort No |
-// Shade No | Product Name | Type | Description | UOM | Colour |
-// Quantity), so every matching variant (e.g. Uniform Shirting "Senator"
-// in both "Bld/Dyed" and "503 R.Blue") is its own row with its own qty
-// stepper + Add — instead of resolving down to one single product "box".
+// Customer Product Selection — pick a Type tab, search/choose a Product
+// Name, and every matching variant appears as its own row with a qty
+// stepper + Add. "Add" pushes into the shared, persistent cart
+// (utils/customerCart.js); nothing is submitted here. Reviewing and
+// submitting happens on the Order Enquiry page via "View Cart & Submit".
 //
-// "Add" on a row just adds that one product+qty to a shared, persistent
-// cart (utils/customerCart.js) — it does NOT submit anything. There is
-// no "Submit Enquiry" control anywhere on this page; reviewing everything
-// you've added and actually submitting the enquiry only happens on the
-// separate Order Enquiry (cart) page, reached via "View Cart & Submit".
+// ── Drafts ──
+// Resuming a draft (from CustomerDrafts.jsx) lands here via
+// /customer/catalog?draftId=... — its items are loaded into the shared
+// cart and its Additional Details are stashed via utils/draftSession.js
+// for Order Enquiry. "💾 Save Draft" saves, clears the cart, and lands on
+// the Drafts list. "My Drafts" clears any pending resume handoff.
 //
-// ── Drafts touch this page two ways now ──
-// 1) Resuming a draft (from CustomerDrafts.jsx) lands HERE, not on Order
-//    Enquiry — via /customer/catalog?draftId=... — because this is
-//    where you'd actually want to keep shopping. The draft's items are
-//    loaded into the shared cart; its Additional Details (Requested
-//    Date / Ref-PO / Remarks), which don't live on this page, are
-//    stashed via utils/draftSession.js for Order Enquiry to pick up
-//    once the customer clicks through to it.
-// 2) "💾 Save Draft" lives in the Cart Summary sidebar here too now —
-//    saving from either this page or Order Enquiry always: saves, clears
-//    the cart, and lands on the Drafts list, matching "save draft ends
-//    this cart" behavior on both pages. Since Additional Details aren't
-//    editable here, a save from this page keeps whatever details the
-//    draft already had (if resumed) rather than wiping them.
+// ── Cart / quantity notes ──
+// The customer cart is a single shared cart (no per-customer scoping),
+// so clearCart() takes no argument. Rows start at qty 0.
 //
-// "My Drafts" also clears any pending resume handoff — if the customer
-// bails out to the drafts list instead of continuing to Order Enquiry,
-// there should be nothing left over to leak into some unrelated later
-// visit to Order Enquiry.
+// ── CHANGE (Blouse table space + full-name hover card) ──
+// 1) The Blouse split tables used equal-width columns, so short columns
+//    (S.No, UOM) wasted space while Product Name got truncated. They now
+//    use a <colgroup> that gives Product Name the most room.
+// 2) Hovering a Product Name cell (Blouse or single table) shows a small
+//    fixed-position card with the full name. The card hides on scroll.
 //
-// ── FIX (Clear Cart) ──
-// handleClearCart used to guard on / call clearCart(customerId), but
-// this page has no `customerId` — the customer-facing cart
-// (utils/customerCart.js) is a single shared cart, not scoped per
-// customer like the End User cart is. Referencing that undefined
-// variable threw a ReferenceError the instant "Clear Cart" was clicked,
-// so the cart never actually cleared. clearCart() now takes no
-// argument, matching customerCart.js's real signature.
-//
-// ── FIX (default quantity) ──
-// Every row used to start at qty 1 (getRowQty fallback, the Math.max
-// floor in setRowQtyFor, and the qty <input>'s min/fallback). Rows now
-// start at 0, matching the End User Product Selection page, so nothing
-// gets added until the customer actually picks a quantity.
-import { useEffect, useMemo, useRef, useState } from "react";
+// ── CHANGE (empty-selection alerts) ──
+// "+ Add" with qty 0, "Save Draft" with an empty cart, and
+// "View Cart & Submit" with an empty cart now show an alert asking the
+// customer to select at least one product.
+import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import CustomerLayout from "../components/CustomerLayout";
 import { useTheme } from "../ThemeContext";
@@ -60,32 +37,47 @@ import API from "../services/api";
 import { getCart, addToCart, clearCart, subscribeToCart } from "../utils/customerCart";
 import { getDraft, saveDraft as saveDraftEntry } from "../utils/customerDrafts";
 import { getDraftSession, setDraftSession, clearDraftSession } from "../utils/draftSession";
+import { BRAND } from "../brand";
+import SuggestInput from "../components/SuggestInput";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const PAGE_SIZE = 100; // rows fetched + rendered per page
 
 const TAB_COLORS = ["#1F5C99", "#2E7D32", "#6A3FA0", "#C9740B", "#0E7C86", "#B23A3A"];
-const TAB_ICONS  = { blouse: "👚", dhoti: "📜", uniform: "🎽", "uniform shirting": "🎽", "uniform suiting": "🧥", "premier shirting": "👔", pant: "👖", shirt: "👔", leggings: "🩳", bundle: "🧶", hank: "🧵", cone: "🧵", others: "📦" };
+const TAB_ICONS = { blouse: "👚", dhoti: "📜", uniform: "🎽", "uniform shirting": "🎽", "uniform suiting": "🧥", "premier shirting": "👔", pant: "👖", shirt: "👔", leggings: "🩳", bundle: "🧶", hank: "🧵", cone: "🧵", others: "📦" };
 
+// Top-level "Type" -> the real SubType values that nest under it.
 const TYPE_GROUPS = {
   "Blouse": ["Blouse"],
   "Dhoti": ["Dhoti", "BO Grey - Dhothies", "BO Fabric - Dhothies"],
   "Uniform Shirting": ["Uniform Shirting"],
   "Uniform Suiting": ["Uniform Suiting"],
+  "Others": ["Others"], // intentionally empty - no data is loaded for this tab
 };
 
-function dummyUom(subType) {
-  const u = (subType || "").toLowerCase();
-  if (u.includes("shirting") || u.includes("suiting") || u.includes("blouse")) return "m";
-  return "pcs";
+// Counts cart LINES (not quantities) per top-level Type.
+function typeCounts(cart) {
+  const counts = {};
+  cart.forEach((line) => {
+    const subType = line.product?.SubType;
+    let type = "Others";
+    for (const [t, subs] of Object.entries(TYPE_GROUPS)) {
+      if (subs.includes(subType)) { type = t; break; }
+    }
+    counts[type] = (counts[type] || 0) + 1;
+  });
+  return counts;
+}
+
+// Kept (unused) in case the UOM-driven quantity header comes back.
+function qtyColumnLabel(uom) {
+  if (uom === "Pieces") return "Pieces of Length";
+  if (uom === "Meter") return "No. Of Meters";
+  return "No. of Cases";
 }
 const DUMMY_SWATCHES = ["#8FD9A8", "#7FD1E0", "#E893C9", "#9A9AA5", "#F0A15C", "#B7A6E0"];
 
-// ── Dummy fallbacks for the per-row Type / Description / Shade No —
-// pulled straight from the variant wording seen across the requirements
-// sheet (Blouse/Dhoti/Uniform Shirting/Uniform Suiting/Premier Shirting
-// tabs) so placeholder rows still look like real catalog rows. Real
-// values from the API always win; these only fill the gap. Kept
-// identical to the End User page so both roles show the same data.
+// Placeholder fallbacks; real API values always win.
 const DUMMY_TYPES = ["BLD & DYED", "Bld/Dyed", "R.Blue/G.Blue", "Fiber Dyed", "YD Dyed", "YD Slub", "3.7 & 7.4", "8*137 (Box)", "Spl Maroon"];
 const DUMMY_DESCRIPTIONS = [
   "Premium quality fabric, soft handfeel, colourfast dyeing.",
@@ -99,12 +91,6 @@ const DUMMY_SHADE_NOS = ["SH-101", "SH-102", "SH-103", "SH-104", "SH-105", "SH-1
 function dummyType(product, i) {
   return product.Type || DUMMY_TYPES[i % DUMMY_TYPES.length];
 }
-// NOTE: the backend's product.Description field currently holds the same
-// text as the per-row Type (the original "Type went blank, Description
-// got the Type text" bug), so it can't be trusted as a real description
-// yet. Until the backend sends an actual description, this always uses
-// the rotating placeholder sentence so the column doesn't just repeat
-// the Type column back at you.
 function dummyDescription(product, i) {
   const real = product.Description;
   const looksLikeType = real && (real === product.Type || DUMMY_TYPES.includes(real));
@@ -114,7 +100,22 @@ function dummyShadeNo(product, i) {
   return product.ShadeNo || DUMMY_SHADE_NOS[i % DUMMY_SHADE_NOS.length];
 }
 
-const UOM_OPTIONS = ["All", "m", "pcs"];
+// Real value (sent to cart/backend) is kept separate from its label.
+const UOM_OPTIONS = [
+  { value: "Pieces", label: "Pieces" },
+  { value: "Meter", label: "Mtr" },
+  { value: "Box", label: "Cases" },
+];
+const uomLabel = (value) => UOM_OPTIONS.find((o) => o.value === value)?.label || value;
+
+// Dhoti-family SubTypes use "Border No" instead of "Shade No".
+const DHOTI_SUBTYPES = new Set(["Dhoti", "dhoti", "Cotton Dhoti Grey", "cotton dhoti grey", "BO Grey - Dhothies", "Cotton Dhoti Fabric", "cotton dhoti fabric", "BO Fabric - Dhothies"]);
+function isDhotiSubType(subType) {
+  return DHOTI_SUBTYPES.has(subType);
+}
+function shadeOrBorderLabel(subType) {
+  return isDhotiSubType(subType) ? "Border" : "Shade";
+}
 
 function formatDate(d) {
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }).replace(/ /g, "-");
@@ -133,42 +134,49 @@ export default function ProductCatalog() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const [activeType, setActiveType] = useState("");
-  const [activeSubType, setActiveSubType] = useState("");
+  const [activeType, setActiveType] = useState("Blouse");
+  const activeSubType = activeType; // Oracle feed: SubType === Type name
 
-  // ── Combined Product Name search + dropdown ──
-  // One control instead of a separate "Search" box and "Product Name"
-  // select: type to filter the table live, or click in to see/choose from
-  // the full list for the active Sub-type.
+  // Combined Product Name search + dropdown.
   const [nameQuery, setNameQuery] = useState("");
   const [nameMenuOpen, setNameMenuOpen] = useState(false);
   const nameBoxRef = useRef(null);
 
-  // ── Secondary filter row: free-text search across Sort No / Product
-  // Description, plus a UOM dropdown (m / pcs). Separate from the
-  // Product Name combo above — narrows the same table further, doesn't
-  // replace the name search. Mirrors the End User page.
-  const [secondaryQuery, setSecondaryQuery] = useState("");
-  const [uomFilter, setUomFilter] = useState("All");
+  // ── Hover card that shows the full product name ──
+  const [nameTip, setNameTip] = useState(null); // { text, x, y }
+  const showNameTip = (e, text) => {
+    if (!text) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = Math.min(Math.max(r.left + r.width / 2, 170), window.innerWidth - 170);
+    setNameTip({ text, x, y: r.bottom + 8 });
+  };
+  const hideNameTip = () => setNameTip(null);
 
-  // Per-row quantities in the table, keyed by Product.Id — lets every
-  // visible row have its own independent qty stepper before "Add".
+  // Keeps the two Blouse split tables scrolling together.
+  const leftScrollRef = useRef(null);
+  const rightScrollRef = useRef(null);
+  const handleSplitScroll = (which) => (e) => {
+    setNameTip(null);
+    const target = which === "left" ? rightScrollRef.current : leftScrollRef.current;
+    if (target && target.scrollTop !== e.target.scrollTop) target.scrollTop = e.target.scrollTop;
+  };
+
+  // Secondary filter row: Sort No / Shade search + UOM dropdown.
+  const [secondaryQuery, setSecondaryQuery] = useState("");
+  const [uomFilter, setUomFilter] = useState("Box");
+
+  // Per-row quantities/remarks, keyed by product RowKey.
   const [rowQty, setRowQty] = useState({});
+  const [rowRemarks, setRowRemarks] = useState({});
   const [justAddedId, setJustAddedId] = useState(null);
 
   const [cart, setCart] = useState(getCart());
 
-  // ── Draft resume — only meaningful when this page was opened via
-  // /customer/catalog?draftId=... from CustomerDrafts.jsx "Resume". The
-  // draft's items get merged into the shared cart below; draftId itself
-  // is kept so "Save Draft" updates the same draft instead of creating a
-  // duplicate.
+  // Draft resume — only meaningful when opened via
+  // /customer/catalog?draftId=... from CustomerDrafts.jsx "Resume".
   const [draftId, setDraftId] = useState(searchParams.get("draftId") || null);
   const [savingDraft, setSavingDraft] = useState(false);
 
-  // Grid stacks to a single column below this width so the Cart Summary
-  // sidebar never gets pushed off the right edge on a narrower window —
-  // see the `layout` style below for the actual breakpoint logic.
   const [viewportWidth, setViewportWidth] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
@@ -182,14 +190,12 @@ export default function ProductCatalog() {
     if (role !== "customer") { navigate("/login"); return; }
     (async () => {
       try {
-        const [prodRes, custRes] = await Promise.all([
-          API.get("/products", { params: { status: "active" } }),
-          API.get("/customers"),
-        ]);
-        setProducts(prodRes.data);
+        // Only the customer's own profile loads here. Products are fetched
+        // page-by-page from Oracle (see "Server-side paging" below).
+        const custRes = await API.get("/customers");
         setCustomer(custRes.data?.[0] || null);
       } catch {
-        setError("Failed to load the product list. Please refresh.");
+        setError("Failed to load your details. Please refresh.");
       } finally {
         setLoading(false);
       }
@@ -200,12 +206,9 @@ export default function ProductCatalog() {
   }, []);
 
   useEffect(() => {
-    // Resuming a draft: merge its items into the live cart (same
-    // approach Order Enquiry used to use) and stash its Additional
-    // Details for Order Enquiry to restore once the customer clicks
-    // through to it. Drafts saved before item snapshots existed only
-    // have a productId — fetch the catalog once so those can still be
-    // reconstructed instead of silently loading nothing.
+    // Resuming a draft: merge its items into the live cart and stash its
+    // Additional Details for Order Enquiry. Older drafts only have a
+    // productId, so fetch the catalog once to reconstruct those.
     if (!draftId) return;
     const draft = getDraft(draftId);
     if (!draft) return;
@@ -225,7 +228,7 @@ export default function ProductCatalog() {
       items.forEach((it) => {
         const product = it.product || catalog.find((p) => String(p.Id) === String(it.productId));
         if (product) {
-          addToCart({ product, qty: it.qty, color: "", size: "" });
+          addToCart({ product, qty: it.qty, color: "", size: "", uom: it.uom || "Box" });
           loadedCount++;
         }
       });
@@ -253,93 +256,141 @@ export default function ProductCatalog() {
     return () => document.removeEventListener("mousedown", onClick);
   }, []);
 
-  const allSubTypes = useMemo(
-    () => Array.from(new Set(products.map((p) => p.SubType).filter(Boolean))),
-    [products]
-  );
+  // Tabs are fixed - the Oracle feed only ever returns these types.
+  const typeKeys = Object.keys(TYPE_GROUPS);
 
-  const grouped = useMemo(() => {
-    const covered = new Set();
-    const groups = {};
-    for (const [type, subs] of Object.entries(TYPE_GROUPS)) {
-      const present = subs.filter((s) => allSubTypes.includes(s));
-      present.forEach((s) => covered.add(s));
-      if (present.length > 0) groups[type] = present;
-    }
-    const leftover = allSubTypes.filter((s) => !covered.has(s));
-    if (leftover.length > 0) groups["Others"] = leftover.sort();
-    return groups;
-  }, [allSubTypes]);
-
-  const typeKeys = Object.keys(grouped);
-  const subTypesForActiveType = grouped[activeType] || [];
+  // ── Server-side paging (Oracle) ──
+  const [page, setPage] = useState(1);
+  const [totalRows, setTotalRows] = useState(0);
+  const [productsLoading, setProductsLoading] = useState(false);
+  const [debouncedName, setDebouncedName] = useState("");
+  const [debouncedSecondary, setDebouncedSecondary] = useState("");
 
   useEffect(() => {
-    if (!activeType && typeKeys.length > 0) setActiveType(typeKeys[0]);
-  }, [typeKeys, activeType]);
+    const t = setTimeout(() => { setDebouncedName(nameQuery.trim()); setPage(1); }, 350);
+    return () => clearTimeout(t);
+  }, [nameQuery]);
 
   useEffect(() => {
-    if (subTypesForActiveType.length > 0 && !subTypesForActiveType.includes(activeSubType)) {
-      setActiveSubType(subTypesForActiveType[0]);
+    const t = setTimeout(() => { setDebouncedSecondary(secondaryQuery.trim()); setPage(1); }, 350);
+    return () => clearTimeout(t);
+  }, [secondaryQuery]);
+
+  useEffect(() => {
+    // "Others" is a placeholder tab - never hit the server for it.
+    if (activeSubType === "Others") {
+      setProducts([]);
+      setTotalRows(0);
+      setProductsLoading(false);
+      return;
     }
-    // eslint-disable-next-line
-  }, [activeType, subTypesForActiveType]);
+    const ctrl = new AbortController();
+    setProductsLoading(true);
+    API.get("/products", {
+      params: {
+        source: "oracle",
+        type: activeSubType,
+        search: debouncedName,
+        sort_shade: debouncedSecondary,
+        page,
+        per_page: PAGE_SIZE,
+      },
+      signal: ctrl.signal,
+    })
+      .then((res) => {
+        setProducts(res.data.data || []);
+        setTotalRows(res.data.total || 0);
+        setError("");
+      })
+      .catch((err) => {
+        if (err?.code === "ERR_CANCELED" || err?.name === "CanceledError") return;
+        setError("Failed to load products. Please try again.");
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setProductsLoading(false);
+      });
+    return () => ctrl.abort();
+  }, [activeSubType, debouncedName, debouncedSecondary, page]);
+
+  const switchType = (t) => {
+    setActiveType(t);
+    setPage(1);
+    setProducts([]);
+    setTotalRows(0);
+    setNameTip(null);
+    setNameQuery(""); setDebouncedName(""); setNameMenuOpen(false);
+    setSecondaryQuery(""); setDebouncedSecondary("");
+  };
+
+  const totalPages = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+  const pageOffset = (page - 1) * PAGE_SIZE;
+  const goToPage = (p) => {
+    setPage(Math.min(Math.max(1, p), totalPages));
+    leftScrollRef.current?.scrollTo({ top: 0 });
+    rightScrollRef.current?.scrollTo({ top: 0 });
+  };
+
+  // Reset both table halves to the top whenever the rendered rows change.
+  useLayoutEffect(() => {
+    if (leftScrollRef.current) leftScrollRef.current.scrollTop = 0;
+    if (rightScrollRef.current) rightScrollRef.current.scrollTop = 0;
+  }, [products]);
 
   useEffect(() => {
     setNameQuery(""); // fresh search per Type/SubType, not carried over
     setNameMenuOpen(false);
     setSecondaryQuery("");
-    setUomFilter("All");
+    // Blouse is always sold by Pieces; everything else defaults to Box.
+    setUomFilter(activeSubType === "Blouse" ? "Pieces" : "Box");
   }, [activeSubType]);
 
-  // Every distinct Product Name available under the active Sub-type —
-  // shown in the combined dropdown's suggestion list.
-  const namesInSubType = useMemo(() => {
-    const names = products.filter((p) => p.SubType === activeSubType).map((p) => p.Name);
-    return Array.from(new Set(names)).sort();
-  }, [products, activeSubType]);
-
+  // Suggestions come from the rows already on screen (max 50).
   const suggestionNames = useMemo(() => {
     const q = nameQuery.trim().toLowerCase();
-    if (!q) return namesInSubType;
-    return namesInSubType.filter((n) => n.toLowerCase().includes(q));
-  }, [namesInSubType, nameQuery]);
+    const names = Array.from(new Set(products.map((p) => p.Name).filter(Boolean)));
+    return (q ? names.filter((n) => n.toLowerCase().includes(q)) : names).slice(0, 50);
+  }, [products, nameQuery]);
 
-  // The table itself — every catalog row (i.e. every Type/spec variant)
-  // for the active Sub-type, narrowed by whatever's typed into the
-  // combined Product Name box, the secondary Sort No/Description search,
-  // and the UOM filter. Picking a suggestion narrows this to just that
-  // one name's variant(s); clearing the box shows everything again.
-  const tableProducts = useMemo(() => {
-    const q = nameQuery.trim().toLowerCase();
-    const sq = secondaryQuery.trim().toLowerCase();
-    return products
-      .filter((p) => p.SubType === activeSubType)
-      .filter((p) => !q || p.Name.toLowerCase().includes(q))
-      .filter((p, i) => {
-        if (!sq) return true;
-        const sortNo = String(p.Code ?? "").toLowerCase();
-        const desc = dummyDescription(p, i).toLowerCase();
-        return sortNo.includes(sq) || desc.includes(sq);
-      })
-      .filter((p) => uomFilter === "All" || dummyUom(p.SubType) === uomFilter);
-  }, [products, activeSubType, nameQuery, secondaryQuery, uomFilter]);
+  // Sort No / Shade suggestions: the Sort No and Shade values of the rows
+  // currently loaded (the server already narrows them as you type).
+  const sortShadeOptions = useMemo(() => {
+    const vals = [];
+    products.forEach((p, i) => {
+      if (p.SortNo) vals.push(String(p.SortNo));
+      else if (p.Code) vals.push(String(p.Code));
+      if (p.ShadeNo) vals.push(String(p.ShadeNo));
+    });
+    return Array.from(new Set(vals));
+  }, [products]);
 
-  // FIX: rows now start at qty 0 (was 1) — nothing is added until the
-  // customer actually sets a quantity, matching the End User page.
+  // Filtering happens on the server - `products` is already the filtered page.
+  const tableProducts = products;
+
+  const half = Math.ceil(tableProducts.length / 2);
+  const leftRows = useMemo(() => tableProducts.slice(0, half).map((p, i) => ({ p, i: pageOffset + i })), [tableProducts, half, pageOffset]);
+  const rightRows = useMemo(() => tableProducts.slice(half).map((p, i) => ({ p, i: pageOffset + i + half })), [tableProducts, half, pageOffset]);
+
+  // Rows start at qty 0 — nothing is added until a quantity is set.
   const getRowQty = (id) => rowQty[id] ?? 0;
   const setRowQtyFor = (product, qty) => {
     const cap = product.Quantity ?? qty;
-    setRowQty((prev) => ({ ...prev, [product.Id]: Math.max(0, Math.min(qty, cap || qty)) }));
+    setRowQty((prev) => ({ ...prev, [product.RowKey]: Math.max(0, Math.min(qty, cap || qty)) }));
   };
 
+  const getRowRemarks = (id) => rowRemarks[id] ?? "";
+  const setRowRemarksFor = (id, val) => setRowRemarks((prev) => ({ ...prev, [id]: val }));
+
+  // "+ Add": alerts if no quantity has been entered for the row.
   const addRowToCart = (product) => {
-    const qty = getRowQty(product.Id);
-    if (qty <= 0) return;
-    addToCart({ product, qty, color: "", size: "" });
+    const qty = getRowQty(product.RowKey);
+    if (qty <= 0) {
+      window.alert("Please select at least one product quantity.");
+      return;
+    }
+    addToCart({ product, qty, color: "", size: "", uom: uomFilter, remarks: getRowRemarks(product.RowKey) });
     setNotice(`Added ${qty} × ${product.Name} to cart.`);
-    setJustAddedId(product.Id);
-    setTimeout(() => setJustAddedId((cur) => (cur === product.Id ? null : cur)), 1400);
+    setJustAddedId(product.RowKey);
+    setTimeout(() => setJustAddedId((cur) => (cur === product.RowKey ? null : cur)), 1400);
   };
 
   const inCartQty = (productId) => cart.find((i) => i.key.startsWith(`${productId}::`))?.qty || 0;
@@ -347,28 +398,21 @@ export default function ProductCatalog() {
   const cartCount = cart.length;
   const cartQty = cart.reduce((sum, i) => sum + i.qty, 0);
 
-  // FIX: this cart is a single shared cart (utils/customerCart.js has
-  // no per-customer scoping), so there is no `customerId` to guard on
-  // or pass to clearCart(). The old code referenced an undefined
-  // `customerId` variable, which threw a ReferenceError on every click
-  // and silently prevented the cart from ever clearing.
+  // Shared cart, so no customerId to pass to clearCart().
   const handleClearCart = () => {
     if (cart.length === 0) return;
     if (!window.confirm("Clear all items from this cart? This can't be undone.")) return;
     clearCart();
     setRowQty({});
+    setRowRemarks({});
     setNotice("Cart cleared.");
   };
 
-  // ── Save Draft ──
-  // Saves whatever's in the cart right now as a draft, then — same as
-  // Submit does on Order Enquiry — clears the cart and moves on, landing
-  // on the Drafts list instead of leaving a stale cart sitting here.
-  // Additional Details aren't editable on this page, so if this draft
-  // was just resumed (session still tagged with this draftId), keep
-  // whatever it already had rather than wiping them to blank.
+  // Saves the cart as a draft, clears it, and lands on the Drafts list.
+  // Additional Details aren't editable here, so a resumed draft keeps
+  // whatever details it already had.
   const saveDraft = () => {
-    if (cart.length === 0) { setError("Add something to the cart before saving a draft."); return; }
+    if (cart.length === 0) { window.alert("Please select at least one product."); return; }
     setSavingDraft(true);
     try {
       const session = getDraftSession();
@@ -386,7 +430,7 @@ export default function ProductCatalog() {
         items: cart.map((i) => ({
           productId: i.product.Id, code: i.product.Code, name: i.product.Name,
           subType: i.product.SubType, qty: i.qty, product: i.product,
-          color: i.color,
+          color: i.color, uom: i.uom,
         })),
       });
       clearCart();
@@ -397,12 +441,19 @@ export default function ProductCatalog() {
     }
   };
 
-  // Bailing out to the drafts list without continuing to Order Enquiry —
-  // clear the pending handoff so it can't leak into some unrelated later
-  // visit there.
+  // Leaving for the drafts list clears the pending resume handoff.
   const goToDrafts = () => {
     clearDraftSession();
     navigate("/customer/drafts");
+  };
+
+  // "View Cart & Submit": alerts if nothing has been added to the cart.
+  const handleViewCart = () => {
+    if (cart.length === 0) {
+      window.alert("Please select at least one product.");
+      return;
+    }
+    navigate("/customer/enquiry");
   };
 
   const S = {
@@ -428,9 +479,7 @@ export default function ProductCatalog() {
       borderColor: active ? themeG.accent : themeG.border,
     }),
 
-    layout: { display: "grid", gridTemplateColumns: isNarrow ? "1fr" : "minmax(0, 1fr) 300px", gap: 20, alignItems: "start" },
-
-    // ── Combined Product Name search + dropdown ──
+    // Combined Product Name search + dropdown
     comboWrap: { position: "relative", marginBottom: 14 },
     label: { fontSize: 11, fontWeight: 700, color: themeG.textLabel, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6, display: "block" },
     comboInput: { width: "100%", boxSizing: "border-box", padding: "11px 13px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 14, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
@@ -438,7 +487,6 @@ export default function ProductCatalog() {
     comboItem: { padding: "9px 14px", fontSize: 13.5, color: themeG.textMain, cursor: "pointer", fontFamily: FONT },
     comboEmpty: { padding: "10px 14px", fontSize: 12.5, color: themeG.textSub, fontStyle: "italic" },
 
-    // ── Secondary filter row: Sort No / Description search + UOM dropdown ──
     filterRow: { display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 },
     filterCol: { flex: "1 1 240px", minWidth: 200 },
     filterColNarrow: { flex: "0 1 160px", minWidth: 140 },
@@ -446,37 +494,229 @@ export default function ProductCatalog() {
     filterInput: { width: "100%", boxSizing: "border-box", padding: "10px 13px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13.5, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
     filterSelect: { width: "100%", boxSizing: "border-box", padding: "10px 13px", borderRadius: 9, border: `1px solid ${themeG.border}`, fontSize: 13.5, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none", maxWidth: 160 },
 
-    // ── Scrollable table, same shape as the Field Officer's screen ──
     tableCard: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)" },
-    tableScroll: { maxHeight: 340, overflowY: "auto", overflowX: "auto" },
-    table: { width: "100%", minWidth: 900, borderCollapse: "collapse" },
-    th: { textAlign: "left", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0, zIndex: 1 },
-    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap" },
-    tdWrap: { padding: "12px 16px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "normal", maxWidth: 240 },
+    // alignItems: flex-start so a shorter half doesn't stretch into a blank block.
+    tableSplitRow: { display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" },
+    tableCardHalf: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)", flex: "1 1 360px", minWidth: 320 },
+    tableScroll: { maxHeight: 420, overflowY: "auto", overflowX: "auto" },
+    table: { width: "100%", minWidth: 1040, borderCollapse: "collapse" },
+    th: { textAlign: "center", padding: "12px 16px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" },
+    td: { padding: "12px 16px", fontSize: 13.5, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "nowrap", textAlign: "center" },
+    tdWrap: { padding: "12px 16px", fontSize: 13, color: themeG.textSub, borderBottom: `1px solid ${themeG.border}`, whiteSpace: "normal", width: 300, minWidth: 260, maxWidth: 340, lineHeight: 1.4, textAlign: "center" },
     swatch: (c) => ({ width: 20, height: 20, borderRadius: "50%", background: c, border: "1.5px solid rgba(0,0,0,0.14)", display: "inline-block", verticalAlign: "middle" }),
-    shadeNo: { fontSize: 13, fontWeight: 600, color: themeG.textMain },
+    shadeNo: { fontSize: 13, fontWeight: 400, color: themeG.textMain },
 
-    sidebar: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, padding: 20, boxShadow: "0 4px 16px rgba(15,33,56,0.06)", position: isNarrow ? "static" : "sticky", top: 20 },
-    sidebarTitleRow: { display: "flex", alignItems: "center", justifyContent: "space-between", margin: "0 0 16px" },
-    sidebarTitle: { display: "flex", alignItems: "center", gap: 8, fontSize: 14.5, fontWeight: 700, color: themeG.textMain, margin: 0 },
-    clearCartLink: { border: "none", background: "transparent", color: "#B23A3A", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, padding: 0, opacity: cart.length === 0 ? 0.4 : 1, pointerEvents: cart.length === 0 ? "none" : "auto" },
-    qtyBox: { display: "flex", alignItems: "center", gap: 6 },
-    qtyBtn: { width: 26, height: 26, borderRadius: 7, border: `1px solid ${themeG.border}`, background: themeG.bg, color: themeG.textMain, fontSize: 14, fontWeight: 700, cursor: "pointer" },
-    qtyInput: { width: 52, textAlign: "center", padding: "5px 4px", borderRadius: 7, border: `1px solid ${themeG.border}`, fontSize: 13, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
+    qtyBox: { display: "flex", alignItems: "center", justifyContent: "center", gap: 6 },
+    qtyBtn: { width: 32, height: 32, borderRadius: 8, border: `1px solid ${themeG.border}`, background: themeG.bg, color: themeG.textMain, fontSize: 16, fontWeight: 700, cursor: "pointer" },
+    qtyInput: { width: 72, textAlign: "center", padding: "8px 6px", borderRadius: 8, border: `1px solid ${themeG.border}`, fontSize: 15, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
+    remarksInput: { width: 110, padding: "6px 8px", borderRadius: 7, border: `1px solid ${themeG.border}`, fontSize: 12.5, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none", textAlign: "center" },
     addBtn: { padding: "7px 16px", borderRadius: 8, border: "none", background: themeG.accent, color: "#fff", fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
     addedBtn: { padding: "7px 16px", borderRadius: 8, border: "none", background: "#16A34A", color: "#fff", fontSize: 12.5, fontWeight: 700, fontFamily: FONT },
     inCartNote: { fontSize: 10.5, color: themeG.textSub },
 
+    // Compact variants for the Blouse split tables only.
+    tableShade: { width: "100%", borderCollapse: "collapse", tableLayout: "fixed" },
+    thShade: { textAlign: "center", padding: "10px 5px", fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.02em", color: "#FFFFFF", background: "#1F3A63", borderBottom: `1px solid ${themeG.border}`, position: "sticky", top: 0, zIndex: 1 },
+    tdShade: { padding: "8px 5px", fontSize: 12, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+    tableScrollShade: { maxHeight: 380, overflowY: "auto", overflowX: "hidden" },
+    qtyBoxShade: { display: "flex", alignItems: "center", justifyContent: "center", gap: 3 },
+    qtyBtnShade: { width: 20, height: 20, borderRadius: 6, border: `1px solid ${themeG.border}`, background: themeG.bg, color: themeG.textMain, fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 },
+    qtyInputShade: { width: 32, textAlign: "center", padding: "3px 2px", borderRadius: 6, border: `1px solid ${themeG.border}`, fontSize: 11.5, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none" },
+    remarksInputShade: { width: "100%", boxSizing: "border-box", padding: "4px 5px", borderRadius: 6, border: `1px solid ${themeG.border}`, fontSize: 10.5, fontFamily: FONT, color: themeG.textMain, background: themeG.card, outline: "none", textAlign: "center" },
+    addBtnShade: { padding: "5px 8px", borderRadius: 6, border: "none", background: themeG.accent, color: "#fff", fontSize: 10.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, whiteSpace: "nowrap" },
+    addedBtnShade: { padding: "5px 8px", borderRadius: 6, border: "none", background: "#16A34A", color: "#fff", fontSize: 10.5, fontWeight: 700, fontFamily: FONT, whiteSpace: "nowrap" },
+
+    // Hover card showing the full product name
+    nameTip: { position: "fixed", zIndex: 1000, transform: "translateX(-50%)", maxWidth: 320, padding: "10px 14px", borderRadius: 10, background: "#1F3A63", color: "#fff", fontSize: 13, fontWeight: 600, lineHeight: 1.4, boxShadow: "0 8px 24px rgba(15,33,56,0.28)", pointerEvents: "none", wordBreak: "break-word", textAlign: "center" },
+
+    layout: { display: "block" },
+    pagerRow: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginTop: 12, fontSize: 12.5, color: themeG.textSub },
+    pagerBtns: { display: "flex", alignItems: "center", gap: 6 },
+    pagerBtn: (disabled) => ({ padding: "6px 12px", borderRadius: 8, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontSize: 12.5, fontWeight: 600, fontFamily: FONT, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.45 : 1 }),
+
+    // Horizontal Cart Summary (below table)
+    summaryCard: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, padding: "20px 24px", marginTop: 20, boxShadow: "0 4px 16px rgba(15,33,56,0.06)" },
+    summaryHeaderRow: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 },
+    sidebarTitle: { display: "flex", alignItems: "center", gap: 8, fontSize: 14.5, fontWeight: 700, color: themeG.textMain, margin: 0 },
+    clearCartLink: { border: "none", background: "transparent", color: "#B23A3A", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, padding: 0, opacity: cart.length === 0 ? 0.4 : 1, pointerEvents: cart.length === 0 ? "none" : "auto" },
+
+    statsRow: { display: "flex", flexWrap: "wrap", borderTop: `1px solid ${themeG.border}`, borderBottom: `1px solid ${themeG.border}`, padding: "16px 0", marginBottom: 16 },
+    statBlock: { flex: "1 1 160px", padding: "0 24px", borderRight: `1px solid ${themeG.border}` },
+    statBlockLast: { flex: "2 1 320px", padding: "0 24px" },
     statLabel: { fontSize: 11.5, color: themeG.textSub, fontWeight: 600 },
     statValue: { fontSize: 18, fontWeight: 700, color: themeG.textMain },
-    divider: { height: 1, background: themeG.border, margin: "14px 0" },
-    lineItem: { display: "flex", justifyContent: "space-between", fontSize: 12.5, color: themeG.textMain, padding: "5px 0" },
+
+    itemsWrap: { display: "flex", flexWrap: "wrap", gap: 8, maxHeight: 96, overflowY: "auto", marginTop: 4 },
+    itemChip: { display: "inline-flex", alignItems: "center", gap: 4, padding: "5px 10px", borderRadius: 20, background: themeG.bg, border: `1px solid ${themeG.border}`, fontSize: 12, color: themeG.textMain, whiteSpace: "nowrap" },
     lineItemSub: { color: themeG.textSub, fontSize: 11 },
     emptyNote: { fontSize: 12.5, color: themeG.textSub, fontStyle: "italic" },
-    viewCartBtn: { width: "100%", padding: "11px 0", borderRadius: 9, border: "none", background: themeG.accent, color: "#fff", fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, marginTop: 14 },
-    saveDraftBtn: { width: "100%", padding: "10px 0", borderRadius: 9, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT, marginTop: 8 },
-    draftsBtn: { width: "100%", padding: "10px 0", borderRadius: 9, border: `1px solid ${themeG.border}`, background: "transparent", color: themeG.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT, marginTop: 8 },
+
+    categoryRow: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 9 },
+    categoryChip: { display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px 3px 4px", borderRadius: 20, background: themeG.bg, border: `1px solid ${themeG.border}`, fontSize: 11, fontWeight: 600, color: themeG.textSub },
+    categoryChipCount: { display: "inline-flex", alignItems: "center", justifyContent: "center", minWidth: 18, height: 18, padding: "0 5px", borderRadius: 20, background: themeG.accent, color: "#fff", fontSize: 10.5, fontWeight: 700 },
+
+    actionsRow: { display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "flex-end" },
+    draftsBtn: { padding: "10px 18px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: "transparent", color: themeG.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
+    saveDraftBtn: { padding: "10px 18px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
+    viewCartBtn: { padding: "10px 22px", borderRadius: 9, border: "none", background: BRAND.green, color: "#fff", fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT },
   };
+
+  // One of the two side-by-side Blouse tables. <colgroup> gives Product
+  // Name the most room and shrinks S.No / UOM, so there's less dead space.
+  const renderShadeTable = (rows, scrollRef, onScroll) => (
+    <div style={S.tableCardHalf}>
+      <div style={S.tableScrollShade} ref={scrollRef} onScroll={onScroll}>
+        <table style={S.tableShade}>
+          <colgroup>
+            <col style={{ width: "6%" }} />   {/* S.No */}
+            <col style={{ width: "10%" }} />  {/* Sort No */}
+            <col style={{ width: "11%" }} />  {/* Shade */}
+            <col style={{ width: "24%" }} />  {/* Product Name */}
+            <col style={{ width: "8%" }} />   {/* UOM */}
+            <col style={{ width: "16%" }} />  {/* Quantity */}
+            <col style={{ width: "12%" }} />  {/* Remarks */}
+            <col style={{ width: "13%" }} />  {/* Actions */}
+          </colgroup>
+          <thead>
+            <tr>
+              <th style={S.thShade}>S.No</th>
+              <th style={S.thShade}>Sort No</th>
+              <th style={S.thShade}>{shadeOrBorderLabel(activeSubType)}</th>
+              <th style={S.thShade}>Product Name</th>
+              <th style={S.thShade}>UOM</th>
+              <th style={S.thShade}>Quantity</th>
+              <th style={S.thShade}>Remarks</th>
+              <th style={S.thShade}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(({ p, i }) => {
+              const qty = getRowQty(p.RowKey);
+              const already = inCartQty(p.RowKey);
+              return (
+                <tr key={p.RowKey}>
+                  <td style={S.tdShade}>{i + 1}</td>
+                  <td style={S.tdShade}>{p.SortNo || p.Code || "—"}</td>
+                  <td style={S.tdShade}><span style={S.shadeNo}>{dummyShadeNo(p, i)}</span></td>
+                  <td
+                    style={{ ...S.tdShade, cursor: "default" }}
+                    onMouseEnter={(e) => showNameTip(e, p.Name)}
+                    onMouseLeave={hideNameTip}
+                  >
+                    {p.Name}
+                  </td>
+                  <td style={S.tdShade}>{uomLabel(uomFilter)}</td>
+                  <td style={S.tdShade}>
+                    <div style={S.qtyBoxShade}>
+                      <button style={S.qtyBtnShade} onClick={() => setRowQtyFor(p, qty - 1)}>−</button>
+                      <input
+                        style={S.qtyInputShade}
+                        type="number"
+                        min={0}
+                        max={p.Quantity ?? undefined}
+                        placeholder="0"
+                        value={qty === 0 ? "" : qty}
+                        onChange={(e) => setRowQtyFor(p, parseInt(e.target.value, 10) || 0)}
+                      />
+                      <button style={S.qtyBtnShade} onClick={() => setRowQtyFor(p, qty + 1)}>+</button>
+                    </div>
+                  </td>
+                  <td style={S.tdShade}>
+                    <input
+                      type="text"
+                      placeholder="Remarks"
+                      value={getRowRemarks(p.RowKey)}
+                      onChange={(e) => setRowRemarksFor(p.RowKey, e.target.value)}
+                      style={S.remarksInputShade}
+                    />
+                  </td>
+                  <td style={S.tdShade}>
+                    <button style={justAddedId === p.RowKey ? S.addedBtnShade : S.addBtnShade} onClick={() => addRowToCart(p)}>
+                      {justAddedId === p.RowKey ? "✓ Added" : "+ Add"}
+                    </button>
+                    {already > 0 && <p style={S.inCartNote}>In cart: {already}</p>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  // Single, unsplit table — used for every Sub-type EXCEPT Blouse.
+  const renderSingleTable = (rows) => (
+    <div style={S.tableCard}>
+      <div style={S.tableScroll} onScroll={hideNameTip}>
+        <table style={{ ...S.table, width: "100%" }}>
+          <thead>
+            <tr>
+              <th style={S.th}>S.No</th>
+              <th style={S.th}>Sort No</th>
+              <th style={S.th}>{shadeOrBorderLabel(activeSubType)}</th>
+              <th style={S.th}>Product Name</th>
+              <th style={S.th}>UOM</th>
+              <th style={S.th}>Quantity</th>
+              <th style={S.th}>Remarks</th>
+              <th style={S.th}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((p, i) => {
+              const qty = getRowQty(p.RowKey);
+              const already = inCartQty(p.RowKey);
+              return (
+                <tr key={p.RowKey}>
+                  <td style={S.td}>{pageOffset + i + 1}</td>
+                  <td style={S.td}>{p.SortNo || p.Code || "—"}</td>
+                  <td style={S.td}><span style={S.shadeNo}>{dummyShadeNo(p, i)}</span></td>
+                  <td
+                    style={{ ...S.td, cursor: "default" }}
+                    onMouseEnter={(e) => showNameTip(e, p.Name)}
+                    onMouseLeave={hideNameTip}
+                  >
+                    {p.Name}
+                  </td>
+                  <td style={S.td}>{uomLabel(uomFilter)}</td>
+                  <td style={S.td}>
+                    <div style={S.qtyBox}>
+                      <button style={S.qtyBtn} onClick={() => setRowQtyFor(p, qty - 1)}>−</button>
+                      <input
+                        style={S.qtyInput}
+                        type="number"
+                        min={0}
+                        max={p.Quantity ?? undefined}
+                        placeholder="0"
+                        value={qty === 0 ? "" : qty}
+                        onChange={(e) => setRowQtyFor(p, parseInt(e.target.value, 10) || 0)}
+                      />
+                      <button style={S.qtyBtn} onClick={() => setRowQtyFor(p, qty + 1)}>+</button>
+                    </div>
+                  </td>
+                  <td style={S.td}>
+                    <input
+                      type="text"
+                      placeholder="Remarks"
+                      value={getRowRemarks(p.RowKey)}
+                      onChange={(e) => setRowRemarksFor(p.RowKey, e.target.value)}
+                      style={S.remarksInput}
+                    />
+                  </td>
+                  <td style={S.td}>
+                    <button style={justAddedId === p.RowKey ? S.addedBtn : S.addBtn} onClick={() => addRowToCart(p)}>
+                      {justAddedId === p.RowKey ? "✓ Added" : "+ Add"}
+                    </button>
+                    {already > 0 && <p style={S.inCartNote}>Already in cart: {already}</p>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 
   if (loading) {
     return (
@@ -489,198 +729,160 @@ export default function ProductCatalog() {
   return (
     <CustomerLayout>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-      {/* Belt-and-braces against the page ever overflowing the viewport
-          horizontally (which is what was clipping the Cart Summary
-          sidebar off the right edge) — the grid fix above is the real
-          fix, this just guarantees nothing else can do the same thing. */}
       <div style={{ maxWidth: "100%", overflowX: "hidden", boxSizing: "border-box" }}>
 
-      <div style={S.infoCard}>
-        <p style={S.infoTitle}>👤 Customer Information</p>
-        <div style={S.infoGrid}>
-          <div><p style={S.infoLabel}>Customer Name</p><p style={S.infoValue}>{customer?.Name || user.name || "—"}</p></div>
-          <div><p style={S.infoLabel}>Customer Code</p><p style={S.infoValue}>{customer?.Code || "—"}</p></div>
-          <div><p style={S.infoLabel}>Mobile Number</p><p style={S.infoValue}>{customer?.Phone || "—"}</p></div>
-          <div><p style={S.infoLabel}>Area / Region</p><p style={S.infoValue}>{customer?.Taluk ? `${customer.Taluk} — ${customer.District || ""}` : "—"}</p></div>
-          <div><p style={S.infoLabel}>Contact Person</p><p style={S.infoValue}>{customer?.ContactPersons?.[0]?.contactName || "—"}</p></div>
-          <div><p style={S.infoLabel}>Date</p><p style={S.infoValue}>{formatDate(new Date())}</p></div>
+        <div style={S.infoCard}>
+          <p style={S.infoTitle}>👤 Customer Information</p>
+          <div style={S.infoGrid}>
+            <div><p style={S.infoLabel}>Customer Name</p><p style={S.infoValue}>{customer?.Name || user.name || "—"}</p></div>
+            <div><p style={S.infoLabel}>Customer Code</p><p style={S.infoValue}>{customer?.Code || "—"}</p></div>
+            <div><p style={S.infoLabel}>Mobile Number</p><p style={S.infoValue}>{customer?.Phone || "—"}</p></div>
+            <div><p style={S.infoLabel}>Area / Region</p><p style={S.infoValue}>{customer?.Taluk ? `${customer.Taluk} — ${customer.District || ""}` : "—"}</p></div>
+            <div><p style={S.infoLabel}>Contact Person</p><p style={S.infoValue}>{customer?.ContactPersons?.[0]?.contactName || "—"}</p></div>
+            <div><p style={S.infoLabel}>Date</p><p style={S.infoValue}>{formatDate(new Date())}</p></div>
+          </div>
         </div>
-      </div>
 
-      {error && <div style={{ marginBottom: 16, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>{error}</div>}
-      {notice && <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent }}>{notice}</div>}
+        {error && <div style={{ marginBottom: 16, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" }}>{error}</div>}
+        {notice && <div style={{ marginBottom: 16, background: "rgba(15,33,56,0.08)", border: "1px solid rgba(15,33,56,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: themeG.accent }}>{notice}</div>}
 
-      {typeKeys.length > 0 && (
-        <div style={S.tabRow}>
-          {typeKeys.map((t, i) => (
-            <button key={t} onClick={() => setActiveType(t)} style={S.tab(activeType === t, TAB_COLORS[i % TAB_COLORS.length])}>
-              <span>{TAB_ICONS[t.toLowerCase()] || "🧷"}</span> {t}
-            </button>
-          ))}
-        </div>
-      )}
+        {typeKeys.length > 0 && (
+          <div style={S.tabRow}>
+            {typeKeys.map((t, i) => (
+              <button key={t} onClick={() => switchType(t)} style={S.tab(activeType === t, TAB_COLORS[i % TAB_COLORS.length])}>
+                <span>{TAB_ICONS[t.toLowerCase()] || "🧷"}</span> {t}
+              </button>
+            ))}
+          </div>
+        )}
 
-      {subTypesForActiveType.length > 1 && (
-        <div style={S.subTabRow}>
-          {subTypesForActiveType.map((s) => (
-            <button key={s} onClick={() => setActiveSubType(s)} style={S.subTab(activeSubType === s)}>{s}</button>
-          ))}
-        </div>
-      )}
-
-      <div style={S.layout}>
-        {/* ── Combined search/dropdown + scrollable table ── */}
-        <div>
-          <div style={S.comboWrap} ref={nameBoxRef}>
-            <label style={S.label}>Product Name</label>
-            <input
-              style={S.comboInput}
-              placeholder={`Search or choose a ${activeSubType || activeType} product…`}
-              value={nameQuery}
-              onFocus={() => setNameMenuOpen(true)}
-              onChange={(e) => { setNameQuery(e.target.value); setNameMenuOpen(true); }}
-            />
-            {nameMenuOpen && (
-              <div style={S.comboMenu}>
-                {suggestionNames.length === 0 ? (
-                  <div style={S.comboEmpty}>No product name matches "{nameQuery}".</div>
-                ) : (
-                  suggestionNames.map((n) => (
-                    <div
-                      key={n}
-                      style={S.comboItem}
-                      onMouseDown={() => { setNameQuery(n); setNameMenuOpen(false); }}
-                    >
-                      {n}
-                    </div>
-                  ))
+        <div style={S.layout}>
+          {/* Combined search/dropdown + scrollable table */}
+          <div>
+            <div style={S.filterRow}>
+              <div ref={nameBoxRef} style={{ ...S.filterCol, position: "relative" }}>
+                <label style={S.filterLabel}>Product Category</label>
+                <input
+                  style={S.filterInput}
+                  placeholder={`Search or choose a ${activeSubType || activeType} product…`}
+                  value={nameQuery}
+                  onFocus={() => setNameMenuOpen(true)}
+                  onChange={(e) => { setNameQuery(e.target.value); setNameMenuOpen(true); }}
+                />
+                {nameMenuOpen && (
+                  <div style={S.comboMenu}>
+                    {suggestionNames.length === 0 ? (
+                      <div style={S.comboEmpty}>No product name matches "{nameQuery}".</div>
+                    ) : (
+                      suggestionNames.map((n) => (
+                        <div key={n} style={S.comboItem} onMouseDown={() => { setNameQuery(n); setNameMenuOpen(false); }}>
+                          {n}
+                        </div>
+                      ))
+                    )}
+                  </div>
                 )}
               </div>
-            )}
-          </div>
-
-          {/* ── Secondary filters: Sort No / Description search + UOM dropdown ── */}
-          <div style={S.filterRow}>
-            <div style={S.filterCol}>
-              <label style={S.filterLabel}>Search Sort No / Description</label>
-              <input
-                style={S.filterInput}
-                placeholder="e.g. 1481 or “colourfast dyeing”…"
-                value={secondaryQuery}
-                onChange={(e) => setSecondaryQuery(e.target.value)}
-              />
+              <div style={S.filterCol}>
+                <label style={S.filterLabel}>Search Sort No / Shade</label>
+                <SuggestInput
+                  inputStyle={S.filterInput}
+                  menuStyle={S.comboMenu}
+                  itemStyle={S.comboItem}
+                  placeholder="e.g. 1481…"
+                  value={secondaryQuery}
+                  onChange={setSecondaryQuery}
+                  options={sortShadeOptions}
+                />
+              </div>
+              <div style={S.filterColNarrow}>
+                <label style={S.filterLabel}>UOM</label>
+                <select style={S.filterSelect} value={uomFilter} onChange={(e) => setUomFilter(e.target.value)}>
+                  {UOM_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
             </div>
-            <div style={S.filterColNarrow}>
-              <label style={S.filterLabel}>UOM</label>
-              <select style={S.filterSelect} value={uomFilter} onChange={(e) => setUomFilter(e.target.value)}>
-                {UOM_OPTIONS.map((u) => (
-                  <option key={u} value={u}>{u}</option>
-                ))}
-              </select>
-            </div>
-          </div>
 
-          <div style={S.tableCard}>
-            {tableProducts.length === 0 ? (
-              <div style={{ padding: 30, textAlign: "center", color: themeG.textSub, fontSize: 13 }}>
-                {activeSubType ? `No ${activeSubType} products match the current filters.` : "No products available."}
+            {productsLoading && tableProducts.length === 0 ? (
+              <div style={S.tableCard}>
+                <div style={{ padding: 30, textAlign: "center", color: themeG.textSub, fontSize: 13 }}>Loading products…</div>
+              </div>
+            ) : tableProducts.length === 0 ? (
+              <div style={S.tableCard}>
+                <div style={{ padding: 30, textAlign: "center", color: themeG.textSub, fontSize: 13 }}>
+                  {activeSubType === "Others" ? "No products in Others yet." : activeSubType ? `No ${activeSubType} products match the current filters.` : "No products available."}
+                </div>
+              </div>
+            ) : activeSubType === "Blouse" ? (
+              <div style={S.tableSplitRow}>
+                {renderShadeTable(leftRows, leftScrollRef, handleSplitScroll("left"))}
+                {rightRows.length > 0 && renderShadeTable(rightRows, rightScrollRef, handleSplitScroll("right"))}
               </div>
             ) : (
-              <div style={S.tableScroll}>
-                <table style={S.table}>
-                  <thead>
-                    <tr>
-                      <th style={S.th}>Sort No</th>
-                      <th style={S.th}>Shade No</th>
-                      <th style={S.th}>Product Name</th>
-                      <th style={S.th}>Type</th>
-                      <th style={S.th}>Description</th>
-                      <th style={S.th}>UOM</th>
-                      <th style={S.th}>Colour</th>
-                      <th style={S.th}>Quantity</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tableProducts.map((p, i) => {
-                      const qty = getRowQty(p.Id);
-                      const swatch = p.Color || DUMMY_SWATCHES[i % DUMMY_SWATCHES.length];
-                      const already = inCartQty(p.Id);
-                      return (
-                        <tr key={p.Id}>
-                          <td style={S.td}>{p.Code || "—"}</td>
-                          <td style={S.td}><span style={S.shadeNo}>{dummyShadeNo(p, i)}</span></td>
-                          <td style={S.td}>{p.Name}</td>
-                          <td style={S.td}>{dummyType(p, i)}</td>
-                          <td style={S.tdWrap}>{dummyDescription(p, i)}</td>
-                          <td style={S.td}>{dummyUom(p.SubType)}</td>
-                          <td style={S.td}><div style={S.swatch(swatch)} /></td>
-                          <td style={S.td}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                              <div style={S.qtyBox}>
-                                <button style={S.qtyBtn} onClick={() => setRowQtyFor(p, qty - 1)}>−</button>
-                                <input
-                                  style={S.qtyInput}
-                                  type="number"
-                                  min={0}
-                                  max={p.Quantity ?? undefined}
-                                  value={qty}
-                                  onChange={(e) => setRowQtyFor(p, parseInt(e.target.value, 10) || 0)}
-                                />
-                                <button style={S.qtyBtn} onClick={() => setRowQtyFor(p, qty + 1)}>+</button>
-                              </div>
-                              <button
-                                style={justAddedId === p.Id ? S.addedBtn : S.addBtn}
-                                onClick={() => addRowToCart(p)}
-                              >
-                                {justAddedId === p.Id ? "✓ Added" : "+ Add"}
-                              </button>
-                            </div>
-                            {already > 0 && <p style={S.inCartNote}>Already in cart: {already}</p>}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+              renderSingleTable(tableProducts)
+            )}
+            {totalRows > 0 && (
+              <div style={S.pagerRow}>
+                <span>
+                  Showing {(pageOffset + 1).toLocaleString()}–{(pageOffset + products.length).toLocaleString()} of {totalRows.toLocaleString()}
+                  {productsLoading ? " · Loading…" : ""}
+                </span>
+                <div style={S.pagerBtns}>
+                  <button style={S.pagerBtn(page <= 1 || productsLoading)} disabled={page <= 1 || productsLoading} onClick={() => goToPage(1)}>« First</button>
+                  <button style={S.pagerBtn(page <= 1 || productsLoading)} disabled={page <= 1 || productsLoading} onClick={() => goToPage(page - 1)}>‹ Prev</button>
+                  <span>Page {page} / {totalPages}</span>
+                  <button style={S.pagerBtn(page >= totalPages || productsLoading)} disabled={page >= totalPages || productsLoading} onClick={() => goToPage(page + 1)}>Next ›</button>
+                  <button style={S.pagerBtn(page >= totalPages || productsLoading)} disabled={page >= totalPages || productsLoading} onClick={() => goToPage(totalPages)}>Last »</button>
+                </div>
               </div>
             )}
           </div>
         </div>
 
-        {/* ── Cart Summary ── */}
-        <div style={S.sidebar}>
-          <div style={S.sidebarTitleRow}>
+        {/* Cart Summary — horizontal, below the table */}
+        <div style={S.summaryCard}>
+          <div style={S.summaryHeaderRow}>
             <p style={S.sidebarTitle}>🛒 Cart Summary</p>
             <button style={S.clearCartLink} onClick={handleClearCart} disabled={cart.length === 0}>
               🗑 Clear Cart
             </button>
           </div>
 
-          <p style={S.statLabel}>Selected Products</p>
-          <p style={S.statValue}>{cartCount}</p>
+          <div style={S.statsRow}>
+            <div style={S.statBlock}>
+              <p style={S.statLabel}>Total Quantity</p>
+              <p style={S.statValue}>{cartQty}</p>
+            </div>
+            <div style={S.statBlockLast}>
+              <p style={S.statLabel}>Selected Products</p>
+              <p style={S.statValue}>{cartCount}</p>
+              {cartCount > 0 && (
+                <div style={S.categoryRow}>
+                  {Object.entries(typeCounts(cart)).map(([type, count]) => (
+                    <span key={type} style={S.categoryChip}>
+                      {type} <span style={S.categoryChipCount}>{count}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
 
-          <p style={{ ...S.statLabel, marginTop: 10 }}>Total Quantity</p>
-          <p style={S.statValue}>{cartQty}</p>
-
-          <div style={S.divider} />
-
-          <p style={{ ...S.statLabel, marginBottom: 8 }}>Selected Items</p>
-          {cart.length === 0 ? (
-            <p style={S.emptyNote}>No items selected</p>
-          ) : (
-            cart.map((i) => (
-              <div key={i.key} style={S.lineItem}>
-                <span>{i.product.Name} <span style={S.lineItemSub}>({i.product.Code})</span></span>
-                <span>{i.qty}</span>
-              </div>
-            ))
-          )}
-
-          <button style={S.viewCartBtn} onClick={() => navigate("/customer/enquiry")}>View Cart & Submit →</button>
-          <button style={S.saveDraftBtn} disabled={savingDraft} onClick={saveDraft}>💾 Save Draft</button>
-          <button style={S.draftsBtn} onClick={goToDrafts}>📑 My Drafts</button>
+          <div style={S.actionsRow}>
+            <button style={S.draftsBtn} onClick={goToDrafts}>📑 My Drafts</button>
+            <button style={S.saveDraftBtn} disabled={savingDraft} onClick={saveDraft}>💾 Save Draft</button>
+            <button style={S.viewCartBtn} onClick={handleViewCart}>View Cart & Submit →</button>
+          </div>
         </div>
-      </div>
+
+        {/* Full product name hover card */}
+        {nameTip && (
+          <div style={{ ...S.nameTip, left: nameTip.x, top: nameTip.y }}>
+            {nameTip.text}
+          </div>
+        )}
       </div>
     </CustomerLayout>
   );

@@ -1,91 +1,97 @@
 // src/pages/master/SalesOrder.jsx
 //
-// Sales Order — rebuilt as four drill-down views, one per stat card on the
-// Marketing Review page ("Pending Final Approval" / "Approved Orders
-// Today" / "Total Order Value" / "ERP Transfer Pending"). Each card's
-// "View Details" link opens this page with a `?view=` query param that
-// selects one of the four tabs below; the tabs can also be switched by
-// hand once you're here. Every view reads from the SAME allocations data
-// Marketing Review writes to (GET /allocations/list) — this is no longer
-// a plain "approved Orders" list.
+// Order Details — now the "Today's Orders" page.
 //
-// NOTE: Checkbox selection / bulk actions, the per-row Actions column,
-// the Remarks column, and the ERP SO Status column have been removed.
-// This page is now read-only — Approve / Reject / Transfer to ERP still
-// live on the Marketing Review page.
+// Every view on this page (Today's Inquiries / Pending Allocation / Full
+// Allocation / Awaiting Approval / All Allocation for Admin & Super Admin;
+// Approved Orders Today / ERP Transfer Pending / ERP SO Created / Edit
+// Allocation for System Admin) shows ONLY orders placed TODAY. The full,
+// all-time list lives on the Order List page (/master/orders).
 //
-// SEARCH BAR + TYPE PILLS (latest): brought in line with CustomerOrders.jsx
-// / Batches.jsx instead of the old two-level Type-tab -> Sub-type-pill
-// structure. Same search bar look (icon input, matches Order No /
-// Customer / Customer Code / Product / Product Code) and a single flat
-// row of pills — Dhoti / Blouse / Uniform Shirting / Uniform Suiting /
-// Others, plus an "All" pill — using the identical match/groupFor()
-// convention as CLOTH_GROUPS in CustomerOrders.jsx / Batches.jsx. Both
-// are shared across all four views and reset whenever the tab (view)
-// changes, same as before.
+// Expired Partials: the old standalone /master/partial-expired page is gone.
+// Its content is the "Expired Partials" tab inside the Pending Allocation
+// view — partial orders still short of their requested qty 48 hours after
+// their first allocation. These are, by definition, older than today, so
+// that tab is NOT limited to today's orders.
 //
-// ORDER NO COLUMN: added immediately after S.No in every view's table.
-// Real allocation rows don't all agree on a single field name for this
-// across the backend, so orderNoOf() below tries the common variants
-// (orderNo / OrderNo / order_no / orderId / OrderId / orderNumber) the
-// same way subTypeOf() already falls back across subType/SubType/etc.
+// Embedded mode: OrderList.jsx renders this component with `embedded` /
+// `forcedView`. In that mode nothing changes — no today-only filter, the
+// old date picker is kept, and the heading stays "Order details".
 //
-// PRODUCT TYPE PILLS (fixed): the first attempt at this assumed each
-// /allocations/list row already carried its own subType/category field
-// — it doesn't, so the pills silently never had anything to group.
-// Fixed by fetching /products separately (same call OrderList.jsx
-// already makes) and building a productCode -> SubType lookup, since
-// every product record does carry a real SubType (see ProductCatalog.jsx
-// / ProductSelection.jsx, p.SubType). Each allocation row's subType is
-// now resolved via r.productCode against that lookup, falling back to
-// r.subType/r.SubType/r.category/r.Category if the row happens to
-// already include one directly.
+// Read-only page except System Admin's Edit Allocation view and the Reject /
+// Sale Loss buttons of the Pending Final Approval view (used when embedded).
 //
-// REJECTED ORDERS TAB (new): a fifth System Admin view showing orders
-// that were rejected via the "Reject" button on the Pending Final
-// Approval tab (that button calls handleCancel -> POST
-// /allocations/{id}/cancel, which — per the note on handleCancel below —
-// is expected to set the allocation's status to "cancelled" once that
-// endpoint exists on the backend). This tab just reads the same
-// /allocations/list endpoint filtered to status=cancelled, so it'll
-// start showing real rows as soon as that backend piece lands.
+// Product Code: shows Oracle's real ORDERITEMCODE (same as Marketing Review).
+// /allocations/list only returns the internal code, so a lookup is built from
+// /allocations/board. If AllocationController@list ever returns
+// `orderItemCode` on each row, that value is used first.
+//
+// Needs the updated AllocationController@list (order_date, include_untouched
+// params; inquiryDate + firstAllocatedAt in the response). Without it the
+// page still loads, but the "today" filter falls back to the old behaviour.
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
-import { Search, Shirt, Layers, Briefcase, Ruler, LayoutGrid } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { Search, Shirt, Layers, Briefcase, Ruler, LayoutGrid, Pencil } from "lucide-react";
 import Layout from "../../components/AppLayout";
 import { useTheme } from "../../ThemeContext";
 import { getG } from "../../theme";
 import API from "../../services/api";
 
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const PARTIAL_WINDOW_HOURS = 48;
 
-// System Admin's five drill-downs — tied to the final approval + ERP
-// handoff work that's theirs, plus a Rejected Orders tab covering
-// orders rejected off the Pending Final Approval tab.
+// System Admin's drill-downs.
 const SYSADMIN_VIEWS = [
+  // Pending Final Approval and Rejected Orders live HERE (Order Details),
+  // not on the Order List page.
   { id: "pending_final_approval", label: "Pending Final Approval" },
-  { id: "approved_today",         label: "Approved Orders Today" },
-  { id: "total_order_value",      label: "Total Order Value" },
-  { id: "erp_transfer_pending",   label: "ERP Transfer Pending" },
-  { id: "rejected_orders",        label: "Rejected Orders" },
+  { id: "approved_today", label: "Approved Orders Today" },
+  { id: "erp_transfer_pending", label: "ERP Transfer Pending" },
+  { id: "erp_so_created", label: "ERP SO Created" },
+  { id: "rejected_orders", label: "Rejected Orders" },
+  { id: "edit_allocation", label: "Edit Allocation" },
 ];
 
-// Admin's four drill-downs — match Admin's own stat cards on Marketing
-// Review (Today's Inquiries / Pending Allocation / Available Stock /
-// Awaiting Approval), which describe the allocation work still on
-// Admin's plate rather than System Admin's final-approval workflow.
+// Views that are NOT limited to today's orders. Empty = every view on the
+// Today's Orders page shows today's orders only. If System Admin should also
+// see OLDER orders still waiting for approval, put "pending_final_approval"
+// (and/or "rejected_orders") in this list.
+const ALL_DATE_VIEWS = [];
+
+// Admin's drill-downs — match Admin's stat cards on Marketing Review.
 const ADMIN_VIEWS = [
-  { id: "today_inquiries",   label: "Today's Inquiries" },
+  { id: "today_inquiries", label: "Today's Inquiries" },
   { id: "pending_allocation", label: "Pending Allocation" },
-  { id: "available_stock",   label: "Available Stock" },
+  { id: "full_allocation", label: "Full Allocation" },
   { id: "awaiting_approval", label: "Awaiting Approval" },
+  { id: "available_stock", label: "All Allocation" },
 ];
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// Super Admin — Admin's views plus three ERP/rejection-tracking views.
+const SUPERADMIN_VIEWS = [
+  ...ADMIN_VIEWS,
+  { id: "erp_transfer_pending", label: "ERP Transfer Pending" },
+  { id: "erp_so_created", label: "ERP SO Created" },
+  { id: "rejected_orders", label: "Rejected Orders" },
+];
 
-// ── Type pills — identical match/groupFor() convention as
-// CLOTH_GROUPS in CustomerOrders.jsx / Batches.jsx, so a Sub Type
-// resolves to the same pill everywhere it appears in the app. ──
+// Local calendar date (YYYY-MM-DD). toISOString() would give the UTC date,
+// which is "yesterday" in India between 00:00 and 05:30.
+const todayStr = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+const todayLabel = () =>
+  new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }).replace(/ /g, "-");
+
+const hoursSince = (iso) => {
+  if (!iso) return null;
+  const t = new Date(String(iso).replace(" ", "T")).getTime();
+  return isNaN(t) ? null : (Date.now() - t) / 36e5;
+};
+
+// ── Type pills — same match/groupFor() convention as Batches.jsx ──
 const CLOTH_GROUPS = [
   { id: "dhoti", name: "Dhoti", match: ["dhoti", "dothi", "cotton dhoti grey", "cotton dhoti fabric"], icon: Layers, color: "#1C7A4B" },
   { id: "blouse", name: "Blouse", match: ["blouse"], icon: Shirt, color: "#1E5B95" },
@@ -96,6 +102,11 @@ const CLOTH_GROUPS = [
 
 const normalize = (v) => (v ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 
+const UOM_LABEL_OVERRIDES = { Meter: "Mtr", Box: "Cases" };
+function uomLabel(value) {
+  return UOM_LABEL_OVERRIDES[value] || value;
+}
+
 const groupFor = (subType) => {
   const c = normalize(subType);
   if (!c) return CLOTH_GROUPS[CLOTH_GROUPS.length - 1]; // Others
@@ -105,20 +116,39 @@ const groupFor = (subType) => {
   return partial || CLOTH_GROUPS[CLOTH_GROUPS.length - 1];
 };
 
-export default function SalesOrder() {
+const EmbedShell = ({ children }) => <>{children}</>;
+
+export default function SalesOrder({ embedded = false, forcedView = null } = {}) {
+  const Shell = embedded ? EmbedShell : Layout;
   const { isDark } = useTheme();
   const themeG = getG(isDark);
   const S = buildStyles(themeG);
 
   const role = localStorage.getItem("role") || "";
   const isSystemAdminRole = role === "system_admin";
-  const VIEWS = isSystemAdminRole ? SYSADMIN_VIEWS : ADMIN_VIEWS;
+  const isSuperAdminRole = role === "super_admin";
+  const VIEWS = isSystemAdminRole ? SYSADMIN_VIEWS : isSuperAdminRole ? SUPERADMIN_VIEWS : ADMIN_VIEWS;
   const defaultViewId = VIEWS[0].id;
 
   const [searchParams, setSearchParams] = useSearchParams();
-  const view = VIEWS.some((v) => v.id === searchParams.get("view"))
-    ? searchParams.get("view")
-    : defaultViewId;
+  const navigate = useNavigate();
+  const view = forcedView
+    ? forcedView
+    : VIEWS.some((v) => v.id === searchParams.get("view"))
+      ? searchParams.get("view")
+      : defaultViewId;
+
+  // Today-only applies to the standalone page, never to the embedded copy
+  // inside Order List.
+  const todayOnly = !embedded && !ALL_DATE_VIEWS.includes(view);
+
+  const isEditAlloc = view === "edit_allocation";
+  const isRejectedView = view === "rejected_orders";
+  const isSysAdminStyleView = [
+    "pending_final_approval", "approved_today",
+    "erp_transfer_pending", "erp_so_created",
+    "rejected_orders", "edit_allocation",
+  ].includes(view);
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -126,16 +156,32 @@ export default function SalesOrder() {
   const [ok, setOk] = useState("");
   const [busyIds, setBusyIds] = useState(() => new Set());
 
-  // ── SubType lookup — fetched once from /products, keyed by product
-  // Code, so every allocation row (which only carries productCode, not
-  // a subType of its own) can still be grouped under the right pill. ──
+  // ── Edit Allocation (System Admin only) ──
+  const [editingRows, setEditingRows] = useState(() => new Set());
+  const [editQtyInputs, setEditQtyInputs] = useState({});
+  const [editMeterInputs, setEditMeterInputs] = useState({});
+  const [savingEditId, setSavingEditId] = useState(null);
+
+  // productCode -> SubType lookup (allocation rows don't carry a subType).
   const [subTypeByCode, setSubTypeByCode] = useState({});
 
-  // ── Type pills (flat row, same as CustomerOrders.jsx) ──
-  const [activeType, setActiveType] = useState("all");
+  // internal product code / `id:<productId>` -> Oracle ORDERITEMCODE
+  // (same source Marketing Review uses).
+  const [orderItemCodeByCode, setOrderItemCodeByCode] = useState({});
 
-  // ── Search bar — shared across all four views, cleared on tab switch. ──
+  const [activeType, setActiveType] = useState("all");
   const [search, setSearch] = useState("");
+  // Manual date picker — only used in embedded mode (Order List). The
+  // standalone page is fixed to today.
+  const [dateFilter, setDateFilter] = useState("");
+
+  // ── Expired Partials (inside Pending Allocation) ──
+  const canSeeExpired = !embedded && view === "pending_allocation";
+  const showExpired = canSeeExpired && searchParams.get("expired") === "1";
+  const [expiredRows, setExpiredRows] = useState([]);
+  const [expiredLoading, setExpiredLoading] = useState(false);
+  const setExpiredTab = (on) =>
+    setSearchParams(on ? { view: "pending_allocation", expired: "1" } : { view: "pending_allocation" });
 
   useEffect(() => {
     (async () => {
@@ -147,56 +193,71 @@ export default function SalesOrder() {
         });
         setSubTypeByCode(map);
       } catch {
-        // Non-fatal — if this fails, rows just fall back to "Others"
-        // until the product list loads successfully.
+        // Non-fatal — rows just fall back to "Others".
       }
     })();
   }, []);
 
-  // Resolve a row's sub-type: prefer a value already on the row itself
-  // (in case the backend adds one later), otherwise look it up by
-  // productCode against the /products map above.
+  // Build the real-code lookup from the allocation board.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await API.get("/allocations/board");
+        const map = {};
+        (res.data?.products || []).forEach((p) => {
+          if (!p.orderItemCode) return;
+          if (p.code) map[p.code] = p.orderItemCode;
+          if (p.productId != null) map[`id:${p.productId}`] = p.orderItemCode;
+        });
+        if (alive) setOrderItemCodeByCode(map);
+      } catch {
+        // Non-fatal — falls back to the internal code.
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
   const subTypeOf = (row) =>
     row.subType || row.SubType || row.category || row.Category ||
     subTypeByCode[row.productCode] || subTypeByCode[row.ProductCode] || null;
 
-  // Resolve a row's order number: real allocation records don't all
-  // agree on a single field name for this, so try the common variants
-  // before giving up — same fallback-chain approach as subTypeOf().
   const orderNoOf = (row) =>
     row.orderNo || row.OrderNo || row.order_no ||
     row.orderId || row.OrderId || row.orderNumber || null;
+
+  // Real Oracle code (ORDERITEMCODE) first, internal code only as a last resort.
+  const productCodeOf = (row) =>
+    row.orderItemCode || row.OrderItemCode ||
+    orderItemCodeByCode[row.productCode] ||
+    (row.productId != null ? orderItemCodeByCode[`id:${row.productId}`] : null) ||
+    row.productCode || row.ProductCode || "—";
+
+  const uomOf = (row) => row.uom || row.UOM || row.Uom || null;
+  const meterOf = (row) => row.meters || row.Meters || row.meter || row.Meter || null;
+  const erpStatusOf = (row) => row.erpStatus || row.ErpStatus || row.erp_status || null;
 
   const load = async () => {
     setLoading(true); setError("");
     try {
       const params = {};
-      if (isSystemAdminRole) {
-        if (view === "pending_final_approval") params.status = "pending";
-        if (view === "approved_today") { params.status = "approved"; params.date = todayStr(); }
-        if (view === "erp_transfer_pending") { params.status = "approved"; params.erp_status = "not_transferred"; }
-        // "total_order_value" intentionally has no status/erp filter — it's
-        // the full picture, sorted by value.
-        // "rejected_orders" — orders rejected off the Pending Final
-        // Approval tab via handleCancel(), which is expected to set the
-        // allocation's status to "cancelled" once its backend endpoint
-        // (POST /allocations/{id}/cancel) is wired up. See the note on
-        // handleCancel below.
-        if (view === "rejected_orders") params.status = "cancelled";
-      } else {
-        // Admin's four views. "pending_allocation" and "available_stock"
-        // are computed/sorted client-side below (see `visible`) rather
-        // than via a status param, since they're a function of
-        // requested/available/allocated qty, not the approval status
-        // field. Backend param names here mirror the pattern already
-        // used above (date/status/erp_status) — if /allocations/list
-        // doesn't yet support `date` as a same-day inquiry filter, this
-        // just falls back to the unfiltered list, matching what
-        // Marketing Review's own inquiryDate filter already assumes.
-        if (view === "today_inquiries") params.date = todayStr();
-        if (view === "awaiting_approval") params.status = "pending";
-        // "pending_allocation" / "available_stock" intentionally have no
-        // server-side filter — the full picture, filtered/sorted below.
+      const today = todayStr();
+      if (view === "pending_final_approval") params.status = "pending";
+      if (view === "approved_today") { params.status = "approved"; if (embedded) params.date = today; }
+      if (view === "erp_transfer_pending") { params.status = "approved"; params.erp_status = "not_transferred"; }
+      if (view === "erp_so_created") { params.status = "approved"; params.erp_status = "erp_so_created"; }
+      if (view === "rejected_orders") params.status = "rejected";
+      if (view === "today_inquiries" && embedded) params.date = today;
+      if (view === "awaiting_approval") params.status = "pending";
+      if (embedded && dateFilter) params.date = dateFilter;
+
+      if (todayOnly) {
+        // Only orders placed today. Views that must also list orders nobody
+        // has allocated to yet ask the server to include those lines too.
+        params.order_date = today;
+        if (["today_inquiries", "pending_allocation", "available_stock"].includes(view)) {
+          params.include_untouched = 1;
+        }
       }
       const res = await API.get("/allocations/list", { params });
       setRows(res.data || []);
@@ -207,33 +268,70 @@ export default function SalesOrder() {
     }
   };
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [view]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [view, dateFilter]);
 
-  // Reset the Type pill and the search box whenever the tab (view)
-  // changes — a Dhoti filter or search term picked under "Pending
-  // Allocation" shouldn't silently keep narrowing "Available Stock" (or
-  // a System Admin view) after switching tabs.
+  // Expired partials come straight from the allocation board: partial orders
+  // (some allocated, some still owed) whose first allocation is 48h+ old.
+  useEffect(() => {
+    if (!canSeeExpired) return;
+    let alive = true;
+    setExpiredLoading(true);
+    (async () => {
+      try {
+        const res = await API.get("/allocations/board");
+        const flat = [];
+        (res.data?.products || []).forEach((p) =>
+          (p.customers || []).forEach((c) => {
+            const allocated = c.allocatedQty || 0;
+            const requested = c.orderedQty || 0;
+            const age = hoursSince(c.firstAllocatedAt);
+            if (allocated > 0 && allocated < requested && age !== null && age >= PARTIAL_WINDOW_HOURS) {
+              flat.push({
+                allocationId: `${p.productId}-${c.orderId}`,
+                orderNo: c.orderNo,
+                customerName: c.name,
+                customerCode: c.code,
+                district: c.district || "",
+                productCode: p.orderItemCode || p.code,
+                productName: p.name,
+                subType: p.subType || p.category,
+                requested,
+                allocated,
+                remaining: requested - allocated,
+                since: c.firstAllocatedAt,
+                hoursOver: Math.floor(age - PARTIAL_WINDOW_HOURS),
+              });
+            }
+          })
+        );
+        if (alive) setExpiredRows(flat);
+      } catch (err) {
+        if (alive) setError(err.response?.data?.message || "Failed to load expired partial allocations.");
+      } finally {
+        if (alive) setExpiredLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [canSeeExpired]);
+
   useEffect(() => {
     setActiveType("all");
     setSearch("");
+    setDateFilter("");
+    setEditingRows(new Set());
+    setEditQtyInputs({});
+    setEditMeterInputs({});
   }, [view]);
-
   const setView = (id) => setSearchParams(id === defaultViewId ? {} : { view: id });
 
-  // Reject — same PATCH /allocations/{id}/decision endpoint Marketing
-  // Review's tick/cross actions use, so a rejection made here shows up
-  // everywhere else that reads allocation status (Marketing Review,
-  // Order Status, the customer/end-user dashboards) — it's the same
-  // shared record, not a page-local flag. Only a still-Pending row can be
-  // rejected, matching the backend's existing rule.
+  // Reject — PATCH /allocations/{id}/decision { status: "rejected" }.
   const handleReject = async (row) => {
     if (!row.allocationId || row.status !== "pending") return;
-    if (!window.confirm(`Reject the order for ${row.customerName} — ${row.productName}?`)) return;
     setBusyIds((s) => new Set(s).add(row.allocationId));
     setError(""); setOk("");
     try {
       await API.patch(`/allocations/${row.allocationId}/decision`, { status: "rejected" });
-      setRows((prev) => prev.map((r) => (r.allocationId === row.allocationId ? { ...r, status: "rejected" } : r)));
+      setRows((prev) => prev.filter((r) => r.allocationId !== row.allocationId));
       setOk("Order rejected.");
     } catch (err) {
       setError(err.response?.data?.message || "Failed to reject this order.");
@@ -242,48 +340,82 @@ export default function SalesOrder() {
     }
   };
 
-  // Cancel — a distinct action from Reject: it pulls the order out of
-  // Sales Order entirely and logs it as a loss, so it can show up on the
-  // Sales Loss Report page (and, now, on this page's own Rejected Orders
-  // tab). NOTE: this calls a new endpoint, POST /allocations/{id}/cancel,
-  // which doesn't exist in the AllocationController shown so far — it
-  // needs to be added there (set the allocation/Order to a 'cancelled'
-  // state and write/expose a row the Sales Loss Report page's own query
-  // reads from, as well as what the Rejected Orders tab above filters
-  // /allocations/list on via status=cancelled). Once that endpoint
-  // responds, the row is simply removed from this page's current list.
+  // Sale Loss — POST /allocations/{id}/cancel, then jump to the report.
   const handleCancel = async (row) => {
     if (!row.allocationId) return;
-    if (!window.confirm(`Cancel the order for ${row.customerName} — ${row.productName}? It will be removed from Sales Order .`)) return;
     setBusyIds((s) => new Set(s).add(row.allocationId));
     setError(""); setOk("");
     try {
       await API.post(`/allocations/${row.allocationId}/cancel`);
-      setRows((prev) => prev.filter((r) => r.allocationId !== row.allocationId));
-      // setOk("Order cancelled and moved to Sales Loss Report.");
+      navigate("/reports/sales-loss");
     } catch (err) {
       setError(err.response?.data?.message || "Failed to cancel this order.");
-    } finally {
       setBusyIds((s) => { const n = new Set(s); n.delete(row.allocationId); return n; });
     }
   };
 
-  // ── Type pill counts (over the full row list for this view, unaffected
-  // by search so switching pills never feels like it's fighting the
-  // search box). ──
+  // ── Edit Allocation actions (System Admin only) ──
+  const startEdit = (row) => {
+    setEditingRows((s) => new Set(s).add(row.allocationId));
+    setEditQtyInputs((s) => ({ ...s, [row.allocationId]: row.allocatedQty || 0 }));
+    setEditMeterInputs((s) => ({ ...s, [row.allocationId]: meterOf(row) || "" }));
+  };
+  const cancelEdit = (row) => {
+    setEditingRows((s) => { const n = new Set(s); n.delete(row.allocationId); return n; });
+    setEditQtyInputs((s) => { const n = { ...s }; delete n[row.allocationId]; return n; });
+    setEditMeterInputs((s) => { const n = { ...s }; delete n[row.allocationId]; return n; });
+  };
+  const setEditQty = (row, val) => {
+    const max = row.requestedQty || 0;
+    const clamped = Math.max(0, max > 0 ? Math.min(Number(val) || 0, max) : (Number(val) || 0));
+    setEditQtyInputs((s) => ({ ...s, [row.allocationId]: clamped }));
+  };
+  const approveEdit = async (row) => {
+    const qty = editQtyInputs[row.allocationId] ?? row.allocatedQty ?? 0;
+    const meter = editMeterInputs[row.allocationId] ?? (meterOf(row) || "");
+    setSavingEditId(row.allocationId);
+    setError(""); setOk("");
+    try {
+      await API.patch(`/allocations/${row.allocationId}/decision`, { allocatedQty: qty, meters: meter });
+      await load();
+      cancelEdit(row);
+      setOk(`Updated allocation for ${row.productName} (${row.customerName}).`);
+      // Tell Marketing Review (if already mounted) to refetch its board.
+      window.dispatchEvent(new CustomEvent("premier-allocation-updated"));
+      try { localStorage.setItem("premier_mr_dirty", String(Date.now())); } catch { /* ignore */ }
+    } catch (err) {
+      setError(err.response?.data?.message || "Failed to update this allocation.");
+    } finally {
+      setSavingEditId(null);
+    }
+  };
+
+  // What the table below is listing: expired partials, or the view's rows.
+  const source = showExpired ? expiredRows : rows;
+
   const catCounts = useMemo(() => {
-    const m = { all: rows.length };
+    const m = { all: source.length };
     CLOTH_GROUPS.forEach((g) => { m[g.id] = 0; });
-    rows.forEach((r) => { m[groupFor(subTypeOf(r)).id] = (m[groupFor(subTypeOf(r)).id] || 0) + 1; });
+    source.forEach((r) => { const id = groupFor(subTypeOf(r)).id; m[id] = (m[id] || 0) + 1; });
     return m;
-  }, [rows, subTypeByCode]);
+    // eslint-disable-next-line
+  }, [source, subTypeByCode]);
+
+  const pendingCount = useMemo(
+    () => rows.filter((r) => (r.allocatedQty || 0) < (r.requestedQty || 0)).length,
+    [rows]
+  );
 
   const visible = useMemo(() => {
-    let list = rows;
+    let list = source;
 
-    // Search bar — matches Order No, Customer, Customer Code, Product,
-    // and Product Code, case-insensitively. Applied before the pill
-    // filter so search always narrows within whatever pill is active.
+    // Safety net for today-only: if the server already sent an order date,
+    // drop anything that isn't today's (expired partials are exempt).
+    if (todayOnly && !showExpired) {
+      const today = todayStr();
+      list = list.filter((r) => !r.inquiryDate || r.inquiryDate === today);
+    }
+
     const q = search.trim().toLowerCase();
     if (q) {
       list = list.filter((r) => {
@@ -293,93 +425,96 @@ export default function SalesOrder() {
           (r.customerName || "").toLowerCase().includes(q) ||
           (r.customerCode || "").toLowerCase().includes(q) ||
           (r.productName || "").toLowerCase().includes(q) ||
-          (r.productCode || "").toLowerCase().includes(q)
+          (r.productCode || "").toLowerCase().includes(q) ||
+          String(productCodeOf(r)).toLowerCase().includes(q) ||
+          (r.district || "").toLowerCase().includes(q)
         );
       });
     }
 
-    // Type pill — narrows to rows whose resolved subType group matches
-    // the selected pill.
     if (activeType !== "all") list = list.filter((r) => groupFor(subTypeOf(r)).id === activeType);
+    if (showExpired) return list;
+
     if (view === "total_order_value") list = [...list].sort((a, b) => b.totalValue - a.totalValue);
-    // Admin's "Pending Allocation" — lines where the allocated qty hasn't
-    // caught up to what was requested yet (mirrors Marketing Review's own
-    // allocFor(row) < row.requested check, just against the server's
-    // saved allocatedQty here since there's no local draft on this page).
     if (view === "pending_allocation") list = list.filter((r) => (r.allocatedQty || 0) < (r.requestedQty || 0));
-    // Admin's "Available Stock" — same full list, ranked by what's left
-    // to allocate rather than by value.
+    if (view === "full_allocation") list = list.filter((r) => (r.requestedQty || 0) > 0 && (r.allocatedQty || 0) >= (r.requestedQty || 0));
     if (view === "available_stock") list = [...list].sort((a, b) => (b.availableQty || 0) - (a.availableQty || 0));
+    if (view === "erp_so_created") list = list.filter((r) => erpStatusOf(r) === "erp_so_created");
+    if (view === "edit_allocation") list = list.filter((r) => (r.allocatedQty || 0) > 0 && r.status === "pending");
+    list = [...list].sort((a, b) => (b.allocationId || 0) - (a.allocationId || 0));
     return list;
-  }, [rows, view, activeType, subTypeByCode, search]);
+    // eslint-disable-next-line
+  }, [source, view, activeType, subTypeByCode, orderItemCodeByCode, search, showExpired, todayOnly]);
 
   const totalValueSum = useMemo(() => rows.reduce((a, r) => a + (r.totalValue || 0), 0), [rows]);
   const totalAvailableSum = useMemo(() => {
-    // Sum available stock once per product, not once per row — several
-    // rows (customers/orders) can share the same product's stock pool.
     const seen = new Map();
     rows.forEach((r) => { if (!seen.has(r.productCode)) seen.set(r.productCode, r.availableQty || 0); });
     return Array.from(seen.values()).reduce((a, v) => a + v, 0);
   }, [rows]);
 
   const fmtAmt = (a) => `₹${(parseFloat(a) || 0).toLocaleString()}`;
+
+  const erpStatusBadge = (row) => {
+    const st = erpStatusOf(row);
+    if (st === "erp_so_created") {
+      return <span style={{ background: "rgba(46,122,114,0.12)", color: "#1E7B4D", border: "1px solid #1E7B4D33", padding: "3px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 700 }}>ERP SO Created</span>;
+    }
+    return <span style={{ background: "rgba(140,150,163,0.12)", color: "#526073", border: "1px solid #52607333", padding: "3px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 700 }}>Not Transferred</span>;
+  };
+
   const statusBadge = (status) => {
     const map = {
-      pending:   { bg: "rgba(214,148,38,0.12)",  color: "#A8701F", label: "Pending" },
-      approved:  { bg: "rgba(46,122,114,0.12)",  color: "#1E7B4D", label: "Approved" },
-      rejected:  { bg: "rgba(178,58,58,0.12)",   color: "#B23A3A", label: "Lost" },
-      // "cancelled" is the status handleCancel's endpoint is expected to
-      // set — this is what the Rejected Orders tab's rows will carry.
-      cancelled: { bg: "rgba(178,58,58,0.12)",   color: "#B23A3A", label: "Rejected" },
+      pending: { bg: "rgba(214,148,38,0.12)", color: "#A8701F", label: "Pending" },
+      approved: { bg: "rgba(46,122,114,0.12)", color: "#1E7B4D", label: "Approved" },
+      rejected: { bg: "rgba(178,58,58,0.12)", color: "#B23A3A", label: "Lost" },
+      cancelled: { bg: "rgba(178,58,58,0.12)", color: "#B23A3A", label: "Rejected" },
     };
     const st = map[status] || { bg: "rgba(140,150,163,0.12)", color: "#526073", label: status || "—" };
     return <span style={{ background: st.bg, color: st.color, border: `1px solid ${st.color}33`, padding: "3px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 700 }}>{st.label}</span>;
   };
 
-  // Admin's read on a row — the same stock-position badge Marketing
-  // Review shows Admin (Fully/Partial Allocated, Stock Shortage), not the
-  // approval-state badge above. Mirrors stockStatus()/stockColor() in
-  // Batches.jsx so the two pages agree.
   const stockPositionBadge = (row) => {
     const requested = row.requestedQty || 0;
     const available = row.availableQty || 0;
     const allocated = row.allocatedQty || 0;
     let label, color, bg;
-    if (available <= 0 && allocated <= 0) { label = "Stock Shortage"; color = "#B23A3A"; bg = "rgba(178,58,58,0.12)"; }
+    if (allocated <= 0) {
+      label = "Not Allocated"; color = "#6B7785"; bg = "rgba(107,119,133,0.12)";
+    }
     else if (allocated >= requested) { label = "Fully Allocated"; color = "#1C7A4B"; bg = "rgba(28,122,75,0.12)"; }
     else { label = "Partial Allocated"; color = "#8A5A0E"; bg = "rgba(138,90,14,0.12)"; }
     return <span style={{ background: bg, color, border: `1px solid ${color}33`, padding: "3px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 700 }}>{label}</span>;
   };
-  // "Awaiting Approval" is the one Admin view that still reflects the
-  // real approval state (what's sitting with System Admin), not stock
-  // position — so it uses statusBadge() like System Admin's views do.
   const rowStatusBadge = (row) =>
-    (isSystemAdminRole || view === "awaiting_approval") ? statusBadge(row.status) : stockPositionBadge(row);
+    (isSysAdminStyleView || view === "awaiting_approval") ? statusBadge(row.status) : stockPositionBadge(row);
+
+  const busyList = showExpired ? expiredLoading : loading;
 
   return (
-    <Layout pageTitle="Sales Order">
-      <h1 style={S.heading}>Order details</h1>
+    <Shell pageTitle={embedded ? "Sales Order" : "Today's Orders"}>
+      
       <p style={S.headingSub}>
-        {VIEWS.find((v) => v.id === view)?.label} — {isSystemAdminRole ? "fed by Marketing Review's Final Approval workflow." : "fed by Marketing Review's allocation board."}
-        {view === "total_order_value" && ` Total: ${fmtAmt(totalValueSum)} across ${rows.length} line(s).`}
-        {view === "today_inquiries" && ` Total: ${rows.length} order line(s).`}
-        {view === "pending_allocation" && ` Total: ${visible.length} line(s) still awaiting full allocation.`}
-        {view === "available_stock" && ` Total available: ${totalAvailableSum.toLocaleString()} Pcs.`}
-        {view === "awaiting_approval" && ` Total: ${rows.length} line(s) awaiting System Admin's decision.`}
-        {view === "rejected_orders" && ` Total: ${rows.length} rejected order(s).`}
+       
+        {showExpired
+          ? `Expired Partials — orders still short of their requested qty ${PARTIAL_WINDOW_HOURS} hours after the first allocation. Total: ${visible.length}.`
+          : (
+            <>
+              {/* {VIEWS.find((v) => v.id === view)?.label || ""} — {isSysAdminStyleView ? "fed by Marketing Review's Final Approval workflow." : "fed by Marketing Review's allocation board."} */}
+              {/* {view === "total_order_value" && ` Total: ${fmtAmt(totalValueSum)} across ${rows.length} line(s).`}
+              {view === "today_inquiries" && ` Total: ${rows.length} order line(s).`}
+              {view === "pending_allocation" && ` Total: ${visible.length} line(s) still awaiting full allocation.`}
+              {view === "full_allocation" && ` Total: ${visible.length} fully allocated line(s).`}
+              {view === "available_stock" && ` Total available: ${totalAvailableSum.toLocaleString()} Pcs.`}
+              {view === "awaiting_approval" && ` Total: ${rows.length} line(s) awaiting System Admin's decision.`}
+              {view === "pending_final_approval" && ` Total: ${visible.length} order(s) waiting for your approval.`}
+              {view === "rejected_orders" && ` Total: ${rows.length} rejected order(s).`}
+              {view === "erp_so_created" && ` Total: ${rows.length} order(s) transferred to ERP.`}
+              {view === "edit_allocation" && ` Total: ${visible.length} allocated line(s) available to edit.`} */}
+            </>
+          )}
       </p>
 
-      <div style={S.tabRow}>
-        {VIEWS.map((v) => (
-          <button key={v.id} onClick={() => setView(v.id)} style={{ ...S.tabBtn, ...(view === v.id ? S.tabBtnActive : {}) }}>
-            {v.label}
-          </button>
-        ))}
-      </div>
-
-      {/* ── Search bar — shared across all four views. Matches Order No,
-            Customer, Customer Code, Product, and Product Code. Same look
-            as CustomerOrders.jsx. ── */}
       <div style={S.filterBar}>
         <div style={S.searchWrap}>
           <Search size={14} style={S.searchIcon} />
@@ -391,30 +526,45 @@ export default function SalesOrder() {
             style={S.searchInput}
           />
         </div>
+        {!embedded && (
+          <select value={view} onChange={(e) => setView(e.target.value)} style={S.viewSelect}>
+            {VIEWS.map((v) => (
+              <option key={v.id} value={v.id}>{v.label}</option>
+            ))}
+          </select>
+        )}
+        {embedded ? (
+          <input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} style={S.dateInput} />
+        ) : (
+          <span style={S.todayChip}>Today · {todayLabel()}</span>
+        )}
       </div>
 
       {error && <div style={S.alertError}>{error}</div>}
       {ok && <div style={S.alertOk}>{ok}</div>}
 
-      {/* ── Type pills — Dhoti / Blouse / Uniform Shirting / Uniform
-            Suiting / Others, plus All. Same flat-row convention as
-            CustomerOrders.jsx / Batches.jsx. ── */}
+      {/* Pending Allocation has two tabs: normal pending lines, and the
+          expired partials that used to have their own page. */}
+      {canSeeExpired && (
+        <div style={S.segRow}>
+          <button style={S.seg(!showExpired)} onClick={() => setExpiredTab(false)}>
+            Pending Allocation ({pendingCount})
+          </button>
+          <button style={S.seg(showExpired)} onClick={() => setExpiredTab(true)}>
+            Expired Partials ({expiredRows.length})
+          </button>
+        </div>
+      )}
+
       <div style={S.pillRow}>
-        <button
-          onClick={() => setActiveType("all")}
-          style={S.pill(activeType === "all", "#0F2138")}
-        >
+        <button onClick={() => setActiveType("all")} style={S.pill(activeType === "all", "#0F2138")}>
           <LayoutGrid size={13} />
           All <span style={S.pillCount}>({catCounts.all || 0})</span>
         </button>
         {CLOTH_GROUPS.map((g) => {
           const Icon = g.icon;
           return (
-            <button
-              key={g.id}
-              onClick={() => setActiveType(g.id)}
-              style={S.pill(activeType === g.id, g.color)}
-            >
+            <button key={g.id} onClick={() => setActiveType(g.id)} style={S.pill(activeType === g.id, g.color)}>
               <Icon size={13} />
               {g.name} <span style={S.pillCount}>({catCounts[g.id] || 0})</span>
             </button>
@@ -424,23 +574,60 @@ export default function SalesOrder() {
 
       <div style={S.card}>
         <div style={S.tableScroll}>
-          {loading ? (
+          {busyList ? (
             <p style={S.empty}>Loading…</p>
           ) : visible.length === 0 ? (
-            <p style={S.empty}>{search ? "No orders match your search." : "Nothing here right now."}</p>
+            <p style={S.empty}>
+              {search
+                ? "No orders match your search."
+                : showExpired
+                  ? "No expired partial allocations."
+                  : todayOnly ? "No orders for today here right now." : "Nothing here right now."}
+            </p>
+          ) : showExpired ? (
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  {["S.No", "Enquiry No", "Customer", "District", "Product Code", "Product", "Requested", "Allocated", "Remaining", "First Allocated", "Expired For"].map((h) => (
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((r, i) => (
+                  <tr key={r.allocationId}>
+                    <td style={S.td}>{i + 1}</td>
+                    <td style={{ ...S.td, fontWeight: 600 }}>{r.orderNo}</td>
+                    <td style={S.td}>{r.customerName}<div style={{ fontSize: 11, color: themeG.textSub }}>{r.customerCode}</div></td>
+                    <td style={S.td}>{r.district || "—"}</td>
+                    <td style={S.td}>{r.productCode}</td>
+                    <td style={S.td}>{r.productName}</td>
+                    <td style={S.td}>{r.requested}</td>
+                    <td style={S.td}>{r.allocated}</td>
+                    <td style={{ ...S.td, fontWeight: 700, color: "#B2622E" }}>{r.remaining}</td>
+                    <td style={S.td}>{String(r.since).slice(0, 16).replace("T", " ")}</td>
+                    <td style={S.td}>{r.hoursOver >= 24 ? `${Math.floor(r.hoursOver / 24)}d ${r.hoursOver % 24}h` : `${r.hoursOver}h`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           ) : (
             <table style={S.table}>
               <thead>
                 <tr>
                   <th style={S.th}>S.No</th>
-                  <th style={S.th}>Order No</th>
-                  <th style={S.th}>Customer</th><th style={S.th}>Customer Code</th>
-                  <th style={S.th}>Product</th><th style={S.th}>Product Code</th>
-                  {!isSystemAdminRole && <th style={S.th}>Requested Qty</th>}
-                  {!isSystemAdminRole && <th style={S.th}>Available Stock</th>}
-                  <th style={S.th}>{isSystemAdminRole ? "Qty" : "Allocated Qty"}</th>
+                  <th style={S.th}>Enquiry No</th>
+                  {!isRejectedView && (<><th style={S.th}>Customer</th><th style={S.th}>Customer Code</th></>)}
+                  <th style={S.th}>Product</th>
+                  {(isEditAlloc || isRejectedView) && <th style={S.th}>Product Code</th>}
+                  <th style={S.th}>UOM</th>
+                  {!isEditAlloc && !isRejectedView && <th style={S.th}>Product Code</th>}
+                  {(!isSysAdminStyleView || view === "edit_allocation") && <th style={S.th}>Requested Qty</th>}
+                  <th style={S.th}>Allocated Qty</th>
+                  <th style={S.th}>Mtr</th>
+                  {isSysAdminStyleView && <th style={S.th}>ERP SO Status</th>}
                   <th style={S.th}>Status</th>
-                  {view === "pending_final_approval" && <th style={S.th}>Actions</th>}
+                  {(view === "pending_final_approval" || view === "edit_allocation") && <th style={S.th}>Actions</th>}
                 </tr>
               </thead>
               <tbody>
@@ -451,34 +638,97 @@ export default function SalesOrder() {
                     <tr key={r.allocationId}>
                       <td style={S.td}>{idx + 1}</td>
                       <td style={S.td}>{orderNoOf(r) || "—"}</td>
-                      <td style={{ ...S.td, fontWeight: 700, color: themeG.accent }}>{r.customerName}</td>
-                      <td style={S.td}>{r.customerCode}</td>
+                      {!isRejectedView && (
+                        <>
+                          <td style={{ ...S.td, fontWeight: 700, color: themeG.accent }}>{r.customerName}</td>
+                          <td style={S.td}>{r.customerCode}</td>
+                        </>
+                      )}
                       <td style={S.td}>{r.productName}</td>
-                      <td style={S.td}>{r.productCode}</td>
-                      {!isSystemAdminRole && <td style={S.td}>{r.requestedQty ?? "—"}</td>}
-                      {!isSystemAdminRole && <td style={S.td}>{r.availableQty ?? "—"}</td>}
-                      <td style={S.td}>{r.allocatedQty}</td>
+                      {(isEditAlloc || isRejectedView) && <td style={S.td}>{productCodeOf(r)}</td>}
+                      <td style={S.td}>{uomOf(r) ? uomLabel(uomOf(r)) : "—"}</td>
+                      {!isEditAlloc && !isRejectedView && <td style={S.td}>{productCodeOf(r)}</td>}
+                      {(!isSysAdminStyleView || view === "edit_allocation") && <td style={S.td}>{r.requestedQty ?? "—"}</td>}
+                      <td style={S.td}>
+                        {view === "edit_allocation" && editingRows.has(r.allocationId) ? (
+                          <input
+                            type="number" min={0} max={r.requestedQty || undefined}
+                            value={
+                              (editQtyInputs[r.allocationId] ?? r.allocatedQty ?? 0) === 0
+                                ? ""
+                                : (editQtyInputs[r.allocationId] ?? r.allocatedQty ?? 0)
+                            }
+                            placeholder="0"
+                            onChange={(e) => setEditQty(r, e.target.value)}
+                            style={S.editInput}
+                          />
+                        ) : (
+                          r.allocatedQty
+                        )}
+                      </td>
+                      <td style={S.td}>
+                        {view === "edit_allocation" && editingRows.has(r.allocationId) ? (
+                          <input
+                            type="text" placeholder="e.g. 5M"
+                            value={editMeterInputs[r.allocationId] ?? ""}
+                            onChange={(e) => setEditMeterInputs((s) => ({ ...s, [r.allocationId]: e.target.value }))}
+                            style={{ ...S.editInput, textAlign: "center" }}
+                          />
+                        ) : (
+                          meterOf(r) || "—"
+                        )}
+                      </td>
+                      {isSysAdminStyleView && <td style={S.td}>{erpStatusBadge(r)}</td>}
                       <td style={S.td}>{rowStatusBadge(r)}</td>
                       {view === "pending_final_approval" && (
                         <td style={S.td}>
                           <div style={{ display: "flex", gap: 6 }}>
                             <button
-                              onClick={() => handleReject(r)}
-                              disabled={!canReject}
-                              title={r.status === "pending" ? "Reject this order" : "Only a Pending order can be rejected"}
-                              style={{ ...S.actionBtnReject, ...(canReject ? {} : S.actionBtnDisabled) }}
+                              onClick={() => handleCancel(r)}
+                              data-confirm="Mark this order as a Sale Loss? It will be removed from Sales Order." data-confirm-title="Sale Loss"
+                              disabled={busy}
+                              title="Cancel this order and log it in Sales Loss Report"
+                              style={{ ...S.actionBtnReject, ...(busy ? S.actionBtnDisabled : {}) }}
                             >
                               Sale Loss
                             </button>
                             <button
-                              onClick={() => handleCancel(r)}
-                              disabled={busy}
-                              title="Cancel this order and log it in Sales Loss Report"
-                              style={{ ...S.actionBtnCancel, ...(busy ? S.actionBtnDisabled : {}) }}
+                              onClick={() => handleReject(r)}
+                              data-confirm="Reject this order?" data-confirm-title="Reject Order"
+                              disabled={!canReject}
+                              title={r.status === "pending" ? "Reject this order" : "Only a Pending order can be rejected"}
+                              style={{ ...S.actionBtnCancel, ...(canReject ? {} : S.actionBtnDisabled) }}
                             >
                               Reject
                             </button>
                           </div>
+                        </td>
+                      )}
+                      {view === "edit_allocation" && (
+                        <td style={S.td}>
+                          {editingRows.has(r.allocationId) ? (
+                            <div style={{ display: "flex", gap: 6 }}>
+                              <button
+                                onClick={() => approveEdit(r)}
+                                disabled={savingEditId === r.allocationId}
+                                style={{ ...S.actionBtnApprove, ...(savingEditId === r.allocationId ? S.actionBtnDisabled : {}) }}
+                              >
+                                {savingEditId === r.allocationId ? "Submitting…" : "Submit"}
+                              </button>
+                              <button
+                                onClick={() => cancelEdit(r)}
+                                disabled={savingEditId === r.allocationId}
+                                style={{ ...S.actionBtnCancel, ...(savingEditId === r.allocationId ? S.actionBtnDisabled : {}) }}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button onClick={() => startEdit(r)} style={S.actionBtnEdit}>
+                              <Pencil size={12} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+                              Edit
+                            </button>
+                          )}
                         </td>
                       )}
                     </tr>
@@ -489,7 +739,7 @@ export default function SalesOrder() {
           )}
         </div>
       </div>
-    </Layout>
+    </Shell>
   );
 }
 
@@ -498,13 +748,12 @@ function buildStyles(themeG) {
     heading: { fontFamily: "'Space Grotesk', " + FONT, fontSize: 26, fontWeight: 700, margin: "0 0 4px", color: themeG.textMain, letterSpacing: "-0.4px" },
     headingSub: { fontSize: 13, color: themeG.textSub, margin: "0 0 14px" },
 
-    tabRow: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 },
-    tabBtn: { padding: "8px 14px", borderRadius: 9, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: FONT },
-    tabBtnActive: { background: themeG.accent, color: "#fff", borderColor: themeG.accent },
-
-    // ── Search bar (shared across all four views) — same look as
-    // CustomerOrders.jsx's filterBar/searchWrap/searchIcon/searchInput. ──
     filterBar: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 16 },
+    viewSelect: {
+      padding: "9px 14px", borderRadius: 10, border: `1px solid ${themeG.border}`,
+      background: themeG.card, color: themeG.textMain, fontFamily: FONT, fontSize: 13,
+      fontWeight: 600, outline: "none", cursor: "pointer", minWidth: 220,
+    },
     searchWrap: { position: "relative", flex: "1 1 260px", maxWidth: 420 },
     searchIcon: { position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: themeG.textSub },
     searchInput: {
@@ -512,8 +761,27 @@ function buildStyles(themeG) {
       border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain,
       fontFamily: FONT, fontSize: 13, outline: "none",
     },
+    dateInput: {
+      padding: "9px 12px", borderRadius: 10, border: `1px solid ${themeG.border}`,
+      background: themeG.card, color: themeG.textMain, fontFamily: FONT, fontSize: 13,
+      outline: "none",
+    },
+    todayChip: {
+      padding: "9px 14px", borderRadius: 10, border: `1px solid ${themeG.border}`,
+      background: themeG.card, color: themeG.textMain, fontFamily: FONT, fontSize: 13, fontWeight: 700,
+      whiteSpace: "nowrap",
+    },
 
-    // ── Type pills (flat row, same as CustomerOrders.jsx) ──
+    // Pending Allocation / Expired Partials switch
+    segRow: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 },
+    seg: (active) => ({
+      padding: "8px 16px", borderRadius: 9,
+      border: `1px solid ${active ? themeG.accent : themeG.border}`,
+      background: active ? themeG.accent : themeG.card,
+      color: active ? "#fff" : themeG.textMain,
+      fontFamily: FONT, fontSize: 12.5, fontWeight: 700, cursor: "pointer",
+    }),
+
     pillRow: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18 },
     pill: (active, color) => ({
       display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 20,
@@ -525,15 +793,16 @@ function buildStyles(themeG) {
     pillCount: { opacity: 0.85, fontWeight: 600 },
 
     card: { background: themeG.card, border: `1px solid ${themeG.border}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 4px 16px rgba(15,33,56,0.06)" },
-    // Shows roughly 10 data rows before scrolling; the header stays
-    // pinned (position: sticky) while the body scrolls underneath it.
     tableScroll: { overflowX: "auto", overflowY: "auto", maxHeight: 460 },
-    table: { width: "100%", tableLayout: "auto", borderCollapse: "collapse" },
-    th: { textAlign: "left", fontSize: 10.5, color: "#FFFFFF", background: "#1F3A63", padding: "10px 12px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, position: "sticky", top: 0, zIndex: 1 },
-    td: { padding: "10px 12px", fontSize: 13, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}` },
+    table: { width: "100%", minWidth: 1180, tableLayout: "auto", borderCollapse: "collapse" },
+    th: { textAlign: "center", fontSize: 10.5, color: "#FFFFFF", background: "#1F3A63", padding: "10px 16px", borderBottom: `1px solid ${themeG.border}`, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" },
+    td: { padding: "10px 16px", fontSize: 13, color: themeG.textMain, borderBottom: `1px solid ${themeG.border}`, textAlign: "center", whiteSpace: "nowrap" },
     actionBtnReject: { padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(178,58,58,0.35)", background: "rgba(178,58,58,0.08)", color: "#B23A3A", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, whiteSpace: "nowrap" },
     actionBtnCancel: { padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(138,90,14,0.35)", background: "rgba(138,90,14,0.08)", color: "#8A5A0E", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, whiteSpace: "nowrap" },
     actionBtnDisabled: { opacity: 0.45, cursor: "not-allowed" },
+    actionBtnEdit: { display: "inline-flex", alignItems: "center", padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(178,58,58,0.35)", background: "rgba(178,58,58,0.08)", color: "#B23A3A", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, whiteSpace: "nowrap" },
+    actionBtnApprove: { padding: "5px 12px", borderRadius: 7, border: "1px solid rgba(28,122,75,0.35)", background: "rgba(28,122,75,0.08)", color: "#1C7A4B", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: FONT, whiteSpace: "nowrap" },
+    editInput: { width: 76, padding: "5px 8px", borderRadius: 7, border: `1px solid ${themeG.border}`, background: themeG.card, color: themeG.textMain, fontFamily: FONT, fontSize: 13, outline: "none" },
     empty: { padding: 50, textAlign: "center", fontSize: 14, color: themeG.textSub },
     alertError: { marginBottom: 18, background: "rgba(178,58,58,0.08)", border: "1px solid rgba(178,58,58,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#B23A3A" },
     alertOk: { marginBottom: 18, background: "rgba(46,122,114,0.08)", border: "1px solid rgba(46,122,114,0.25)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#1E7B4D" },

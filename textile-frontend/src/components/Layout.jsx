@@ -4,10 +4,8 @@ import Header from "./Header";
 import Footer from "./Footer";
 import { useTheme } from "../ThemeContext";
 
-// Read the active category for display in sidebar
-const getActiveCat = () => localStorage.getItem("premier_category") || null;
-
 const FONT = "'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
 // District/Taluk may be stored as a plain array, a JSON-encoded array
 // string, or (due to a past double-encoding bug) a JSON string whose
 // content is itself another JSON array. Keep decoding until it resolves
@@ -28,13 +26,21 @@ function parseAreaList(raw) {
 
 /**
  * Role hierarchy (4 logins):
- *  - super_admin  : read-only everywhere (viewable, not editable/assignable)
- *  - system_admin : full access — can edit/assign, approves admin + end_user accounts,
- *                    assigns area (district/taluk) to both admin and end_user
- *  - admin        : area-scoped operational access (assigned by system_admin),
- *                    can create end_user accounts (pending sys_admin approval)
- *  - end_user     : restricted, area-scoped menu — view/create within their own
- *                    assigned area only, no system-wide master data access
+ *  - super_admin  : read-only everywhere
+ *  - system_admin : full access; approves admin + end_user accounts
+ *  - admin        : area-scoped operational access
+ *  - end_user     : restricted, area-scoped menu
+ *
+ * Sidebar changes in this version:
+ *  - The old "Master" group is now "Order Details".
+ *  - The "Customer" sub-group (Add Customer / Customer List) is removed.
+ *  - "Today's Orders" (the Order Details page, /master/sales-order) sits in
+ *    that group next to "Order List" (all orders).
+ *  - The separate top-level "Order Details" link and the "Expired Partials"
+ *    link are gone (Expired Partials now lives inside Order Details >
+ *    Pending Allocation).
+ *  - Super Admin sees the group with just "Today's Orders", so what was
+ *    visible to them before is unchanged.
  */
 export default function Layout({ children, pageTitle, pageSubtitle }) {
   const location = useLocation();
@@ -44,37 +50,30 @@ export default function Layout({ children, pageTitle, pageSubtitle }) {
   const district = parseAreaList(user.District || localStorage.getItem("District") || "").join(", ");
   const taluk = parseAreaList(user.Taluk || localStorage.getItem("Taluk") || "").join(", ");
   const assignedArea = user.AssignedArea || localStorage.getItem("assignedArea") || district || taluk || "";
-  const activeCat = getActiveCat();
 
   const isSuperAdmin = role === "super_admin";
   const isSystemAdmin = role === "system_admin";
   const isAdmin = role === "admin";
   const isEndUser = role === "end_user";
 
-  // Read-only banner shown for super_admin (viewable but not editable/assignable)
-  const readOnly = isSuperAdmin;
-
-  // These used to default to `true` (Master / Products) regardless of what
-  // page you were on, so the sidebar showed them force-expanded even on
-  // completely unrelated pages like Reports or Enquiry Order. Instead,
-  // each group only starts open if the current URL is actually inside it —
-  // Layout remounts fresh on every navigation (each page wraps its own
-  // <Layout>), so this recomputes correctly every time without needing an
-  // effect. The user can still manually expand/collapse from there.
-  const [masterOpen, setMasterOpen] = useState(
-    () => location.pathname.startsWith("/master/customers")
-      || location.pathname.startsWith("/master/products")
+  // Each group only starts open if the current URL is inside it.
+  const [detailsOpen, setDetailsOpen] = useState(
+    () => location.pathname.startsWith("/master/sales-order")
       || location.pathname.startsWith("/master/orders")
       || location.pathname.startsWith("/master/enquiry")
   );
-  const [productsOpen, setProductsOpen] = useState(() => location.pathname.startsWith("/master/products"));
-  const [ordersOpen, setOrdersOpen] = useState(() => location.pathname.startsWith("/master/orders") || location.pathname.startsWith("/master/enquiry"));
-  const [customersOpen, setCustomersOpen] = useState(() => location.pathname.startsWith("/master/customers"));
-  const [statusOpen, setStatusOpen] = useState(() => location.pathname.startsWith("/status"));
-  // Reports — now a collapsible group of 6 separate report pages (like
-  // Master), so it opens whenever you're on any /reports/* route instead
-  // of defaulting closed regardless of where you are.
   const [reportsOpen, setReportsOpen] = useState(() => location.pathname.startsWith("/reports"));
+  // Admin Master — Super Admin only.
+  const [adminMasterOpen, setAdminMasterOpen] = useState(() => location.pathname.startsWith("/master/admin-master"));
+
+  // Sidebar open/close toggle — persisted across page navigations.
+  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("sidebarOpen") !== "false");
+  const toggleSidebar = () => {
+    setSidebarOpen((prev) => {
+      localStorage.setItem("sidebarOpen", String(!prev));
+      return !prev;
+    });
+  };
 
   const isActive = (path) => location.pathname === path;
   const isPrefix = (path) => location.pathname.startsWith(path);
@@ -86,20 +85,19 @@ export default function Layout({ children, pageTitle, pageSubtitle }) {
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
       <div style={S.body}>
+
         {/* ── Sidebar ── */}
-        <div style={S.sidebar}>
+        <div style={{ ...S.sidebar, width: sidebarOpen ? S.sidebar.width : 0, minWidth: sidebarOpen ? S.sidebar.width : 0, padding: sidebarOpen ? S.sidebar.padding : "20px 0px", overflow: sidebarOpen ? "auto" : "hidden", transition: "width 0.25s ease, min-width 0.25s ease, padding 0.25s ease" }}>
           <div style={S.logoWrap}> <span style={S.logoText}>Premier CRM</span>
           </div>
 
-          {/* Role badge */}
-
-          {(isAdmin || isEndUser) && (assignedArea || district || taluk) && (
+          {/* {(isAdmin || isEndUser) && (assignedArea || district || taluk) && (
             <div style={S.areaBadge}>
               📍 {isAdmin ? (district || assignedArea) : (taluk || assignedArea)}
               {isAdmin && <span style={{ opacity: 0.6 }}> (District)</span>}
               {isEndUser && <span style={{ opacity: 0.6 }}> (Taluk)</span>}
             </div>
-          )}
+          )} */}
 
           <nav style={S.nav}>
             <Link to="/dashboard" style={{ textDecoration: "none" }}>
@@ -109,161 +107,87 @@ export default function Layout({ children, pageTitle, pageSubtitle }) {
               </div>
             </Link>
 
-            {/* Select Category — hidden for end_user (they place orders, not manage catalog) */}
-            {/* {!isEndUser && (
-              <Link to="/select-category" style={{ textDecoration: "none" }}>
-                <div style={{ ...S.navItem, ...(isActive("/select-category") ? S.navItemActive : {}), marginBottom: 4, background: activeCat ? "rgba(91,155,217,0.10)" : "transparent", border: activeCat ? "1px solid rgba(91,155,217,0.25)" : "1px solid transparent", borderRadius: 8 }}>
-                  <span style={S.navIcon}><CategoryIcon /></span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(255,255,255,0.85)" }}>Category</div>
-                    {activeCat && (
-                      <div style={{ fontSize: 11, color: "rgba(255,255,255,0.50)", marginTop: 1 }}>
-                        {activeCat === "cloth" ? "👘 Cloth" : "🧵 Yarn"}
-                      </div>
-                    )}
-                  </div>
-                  {!activeCat && <span style={{ fontSize: 10, color: "rgba(255,200,100,0.85)", fontWeight: 700, letterSpacing: "0.04em" }}>SELECT</span>}
+            {/* Admin Master — Super Admin only. */}
+            {isSuperAdmin && (
+              <div style={S.navGroup}>
+                <div style={S.navGroupHeader} onClick={() => setAdminMasterOpen(!adminMasterOpen)}>
+                  <span style={S.navIcon}><ShieldIcon /></span>
+                  <span style={S.navGroupLabel}>Admin Master</span>
+                  <span style={{ ...S.chevron, transform: adminMasterOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon /></span>
                 </div>
-              </Link>
-            )}
-            <Link to="/master/allocation" style={{ textDecoration: "none" }}>
-              <div style={{ ...S.navItem, ...(isPrefix("/master/allocation") ? S.navItemActive : {}) }}>
-                <span style={S.navIcon}><ChartIcon /></span>
-                <span>Allocation</span>
-              </div>
-            </Link> */}
-
-            {/* FIFO stock batches (Rack vs EB4), Invoices, Claims, and the
-                Customer Compliance dashboard — Marketing-facing O2C steps
-                8/9/11/14. Hidden for end_user (out of their scope). */}
-            {!isEndUser && (
-              <>
-                <Link to="/master/batches" style={{ textDecoration: "none" }}>
-                  <div style={{ ...S.navItem, ...(isPrefix("/master/batches") ? S.navItemActive : {}) }}>
-                    <span style={S.navIcon}><BoxIcon /></span>
-                    <span>Marketing Review</span>
-                  </div>
-                </Link>
-
-                {/* Master — full version for super_admin / system_admin / admin.
-                end_user gets a trimmed "My Orders" style menu instead. */}
-                {!isEndUser ? (
-                  <div style={S.navGroup}>
-                    <div style={S.navGroupHeader} onClick={() => setMasterOpen(!masterOpen)}>
-                      <span style={S.navIcon}><LayersIcon /></span>
-                      <span style={S.navGroupLabel}>Master</span>
-                      <span style={{ ...S.chevron, transform: masterOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon /></span>
+                {adminMasterOpen && (
+                  <div style={S.navGroupBody}>
+                    <div style={S.navLeafGroup}>
+                      <NavLeaf to="/master/admin-master/users" label="New User" active={isPrefix("/master/admin-master/users")} S={S} />
                     </div>
-                    {masterOpen && (
-                      <div style={S.navGroupBody}>
-                        {/* Customer — moved first */}
-                        <div style={{ ...S.navSubItem, ...(isPrefix("/master/customers") ? S.navSubActive : {}) }} onClick={() => setCustomersOpen(!customersOpen)}>
-                          <span>Customer</span>
-                          <span style={{ ...S.chevron, transform: customersOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon small /></span>
-                        </div>
-                        {customersOpen && (
-                          <div style={S.navLeafGroup}>
-                            {!isSuperAdmin && (
-                              <NavLeaf to="/master/customers/add" label="Add Customer" active={isActive("/master/customers/add")} S={S} />
-                            )}
-                            <NavLeaf to="/master/customers" label="Customer List" active={isActive("/master/customers")} S={S} />
-                          </div>
-                        )}
-
-                        {/* Products — second */}
-                        {/* <div style={{ ...S.navSubItem, ...(isPrefix("/master/products") ? S.navSubActive : {}) }} onClick={() => setProductsOpen(!productsOpen)}>
-                          <span>Products</span>
-                          <span style={{ ...S.chevron, transform: productsOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon small /></span>
-                        </div>
-                        {productsOpen && (
-                          <div style={S.navLeafGroup}>
-                            {!isSuperAdmin && (
-                              <NavLeaf to="/master/products/add" label="Add Product" active={isActive("/master/products/add")} S={S} />
-                            )}
-                            <NavLeaf to="/master/products" label="Product List" active={isActive("/master/products")} S={S} />
-                          </div>
-                        )} */}
-
-                        {/* Orders — third */}
-                        <div style={{ ...S.navSubItem, ...((isPrefix("/master/orders") || isPrefix("/master/enquiry")) ? S.navSubActive : {}) }} onClick={() => setOrdersOpen(!ordersOpen)}>
-                          <span>Orders</span>
-                          <span style={{ ...S.chevron, transform: ordersOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon small /></span>
-                        </div>
-                        {ordersOpen && (
-                          <div style={S.navLeafGroup}>
-                            {/* <NavLeaf to="/master/orders/add" label="Add Enquiry" active={isActive("/master/orders/add")} S={S} />
-                            <NavLeaf to="/master/enquiry" label="Enquiry Order" active={isActive("/master/enquiry")} S={S} /> */}
-                            <NavLeaf to="/master/orders" label="Order List" active={isActive("/master/orders")} S={S} />
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Quantity Allocation — product-wise & customer-wise: how
-                    much has been ordered vs. how much stock allows each
-                    customer to actually be given. */}
-
-                  </div>
-                ) : (
-                  /* ── End User trimmed menu — area-scoped orders only ── */
-                  <div style={S.navGroup}>
-                    <div style={S.navGroupHeader} onClick={() => setOrdersOpen(!ordersOpen)}>
-                      <span style={S.navIcon}><LayersIcon /></span>
-                      <span style={S.navGroupLabel}>My Orders</span>
-                      <span style={{ ...S.chevron, transform: ordersOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon /></span>
-                    </div>
-                    {ordersOpen && (
-                      <div style={S.navGroupBody}>
-                        <div style={S.navLeafGroup}>
-                          <NavLeaf to="/master/orders" label="Order List" active={isActive("/master/orders")} S={S} />
-                        </div>
-                      </div>
-                    )}
                   </div>
                 )}
+              </div>
+            )}
 
-                
-                <Link to="/master/sales-order" style={{ textDecoration: "none" }}>
-                  <div style={{ ...S.navItem, ...(isPrefix("/master/sales-order") ? S.navItemActive : {}) }}>
-                    <span style={S.navIcon}><BoxIcon /></span>
-                    <span>Order Details</span>
+            {/* Everything below is staff-only (hidden for end_user). */}
+            {!isEndUser && (
+              <>
+                {/* Marketing Review — hidden for super_admin (still reachable by URL). */}
+                {!isSuperAdmin && (
+                  <Link to="/master/batches" style={{ textDecoration: "none" }}>
+                    <div style={{ ...S.navItem, ...(isPrefix("/master/batches") ? S.navItemActive : {}) }}>
+                      <span style={S.navIcon}><BoxIcon /></span>
+                      <span>Marketing Review</span>
+                    </div>
+                  </Link>
+                )}
+
+                {/* Order Details (was "Master"):
+                      Today's Orders -> the Order Details page, today's orders only
+                      Order List     -> every order, all dates
+                    Super Admin only gets Today's Orders. */}
+                <div style={S.navGroup}>
+                  <div style={S.navGroupHeader} onClick={() => setDetailsOpen(!detailsOpen)}>
+                    <span style={S.navIcon}><LayersIcon /></span>
+                    <span style={S.navGroupLabel}>Order Details</span>
+                    <span style={{ ...S.chevron, transform: detailsOpen ? "rotate(90deg)" : "rotate(0deg)" }}><ChevronIcon /></span>
                   </div>
-                </Link>
-                <Link to="/master/invoices" style={{ textDecoration: "none" }}>
-                  <div style={{ ...S.navItem, ...(isPrefix("/master/invoices") ? S.navItemActive : {}) }}>
-                    <span style={S.navIcon}><ReceiptIcon /></span>
-                    <span>Invoices</span>
-                  </div>
-                </Link>
-                <Link to="/master/credit-limit" style={{ textDecoration: "none" }}>
+                  {detailsOpen && (
+                    <div style={S.navGroupBody}>
+                      <div style={S.navLeafGroup}>
+                        <NavLeaf to="/master/sales-order" label="Today's Orders" active={isPrefix("/master/sales-order")} S={S} />
+                        {!isSuperAdmin && (
+                          <NavLeaf
+                            to="/master/orders"
+                            label="Order List"
+                            active={isPrefix("/master/orders") || isPrefix("/master/enquiry")}
+                            S={S}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* <Link to="/master/credit-limit" style={{ textDecoration: "none" }}>
                   <div style={{ ...S.navItem, ...(isPrefix("/master/credit-limit") ? S.navItemActive : {}) }}>
                     <span style={S.navIcon}><ReceiptIcon /></span>
                     <span>Credit Limit</span>
                   </div>
-                </Link>
+                </Link> */}
                 <Link to="/master/claims" style={{ textDecoration: "none" }}>
                   <div style={{ ...S.navItem, ...(isPrefix("/master/claims") ? S.navItemActive : {}) }}>
                     <span style={S.navIcon}><FlagIcon /></span>
                     <span>Complaints & Claims</span>
                   </div>
                 </Link>
-                {/* <Link to="/master/compliance" style={{ textDecoration: "none" }}>
-                  <div style={{ ...S.navItem, ...(isPrefix("/master/compliance") ? S.navItemActive : {}) }}>
-                    <span style={S.navIcon}><ShieldIcon /></span>
-                    <span>Compliance</span>
-                  </div>
-                </Link> */}
               </>
             )}
-            {/* Order Enquiry — the entry point of the O2C flow, so it sits
-                before Master: Assign -> Approve -> Add Order (in Master). */}
 
+            <Link to="/master/notifications" style={{ textDecoration: "none" }}>
+              <div style={{ ...S.navItem, ...(isPrefix("/master/notifications") ? S.navItemActive : {}) }}>
+                <span style={S.navIcon}><BellNavIcon /></span>
+                <span>Notifications</span>
+              </div>
+            </Link>
 
-
-            {/* Reports — six separate report pages behind one collapsible
-                group, same pattern as Master:
-                  Enquiry Order Report, Overdue Report, Data Report,
-                  Product Wise Report, Ageing Report, Sales Loss Report.
+            {/* Reports — six report pages behind one collapsible group.
                 Hidden for end_user. */}
             {!isEndUser && (
               <div style={S.navGroup}>
@@ -291,13 +215,9 @@ export default function Layout({ children, pageTitle, pageSubtitle }) {
 
         {/* ── Right: Header + Scrollable Content + Footer ── */}
         <div style={S.rightPane}>
-          <Header />
+          <Header sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} pageTitle={pageTitle} />
           <div style={S.scrollArea}>
             <div style={S.main}>
-              {readOnly && (
-                <div >
-                </div>
-              )}
               {children}
             </div>
             <Footer />
@@ -332,7 +252,7 @@ function buildStyles(colors, isDark) {
   return {
     page: {
       display: "flex",
-      height: "100vh",
+      height: "100%",
       overflow: "hidden",
       background: colors.background,
       fontFamily: FONT,
@@ -365,7 +285,7 @@ function buildStyles(colors, isDark) {
         : "radial-gradient(circle at 1px 1px, rgba(15,33,56,0.05) 1px, transparent 0), radial-gradient(1200px 500px at 100% -10%, rgba(31,92,153,0.07), transparent 60%)",
       backgroundSize: "22px 22px, 100% 100%",
       backgroundAttachment: "fixed, fixed",
-      minHeight: "calc(100vh - 62px - 46px)",
+      minHeight: "calc(100% - 46px)",
     },
     sidebar: {
       width: 210,
@@ -509,7 +429,6 @@ function ChevronIcon({ small }) {
     </svg>
   );
 }
-
 function CategoryIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -519,7 +438,6 @@ function CategoryIcon() {
     </svg>
   );
 }
-
 function BoxIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -545,6 +463,14 @@ function ShieldIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z" />
+    </svg>
+  );
+}
+function BellNavIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
     </svg>
   );
 }
